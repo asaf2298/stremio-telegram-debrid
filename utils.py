@@ -194,11 +194,19 @@ def parse_split_info(filename: str) -> tuple:
 _metadata_cache = {}
 
 async def get_metadata_from_cinemeta(meta_type: str, imdb_id: str) -> dict:
+    if not meta_type or not imdb_id:
+        return {}
+    # Harden against path injection / unexpected upstream requests
+    if meta_type not in ("movie", "series") or not re.fullmatch(r"tt\d{5,12}", imdb_id.split(":")[0]):
+        logger.warning(f"Rejected invalid Cinemeta lookup: type={meta_type!r} id={imdb_id!r}")
+        return {}
+
     cache_key = f"{meta_type}:{imdb_id}"
     if cache_key in _metadata_cache:
         return _metadata_cache[cache_key]
 
-    url = f"https://v3-cinemeta.strem.io/meta/{meta_type}/{imdb_id}.json"
+    imdb_clean = imdb_id.split(":")[0]
+    url = f"https://v3-cinemeta.strem.io/meta/{meta_type}/{imdb_clean}.json"
     logger.info(f"Fetching metadata from Cinemeta: {url}")
     
     try:
