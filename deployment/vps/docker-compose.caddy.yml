@@ -25,6 +25,7 @@ services:
       - PORT=7860
       # Public HTTPS URL clients/Stremio should use (no :7860)
       - ADDON_URL=https://${ADDON_DOMAIN}
+      - BEHIND_REVERSE_PROXY=true
     expose:
       - "7860"
     restart: unless-stopped
