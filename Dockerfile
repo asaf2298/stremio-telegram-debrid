@@ -27,6 +27,6 @@ USER user
 # Expose port (Hugging Face Spaces runs on 7860)
 EXPOSE 7860
 
-# Command to run the addon dynamically supporting optional auto-update
-CMD ["sh", "-c", "if [ \"$AUTO_UPDATE\" = \"true\" ]; then echo 'Auto-update enabled. Cloning latest code...'; git clone --depth=1 ${GITHUB_REPO_URL:-https://github.com/SunilRoy-dev/stremio-telegram-debrid.git} /tmp/app && cp -r /tmp/app/* . && rm -rf /tmp/app && pip install --no-cache-dir --user -r requirements.txt tgcrypto; fi && uvicorn addon:app --host 0.0.0.0 --port ${PORT:-7860} --timeout-keep-alive 300 --timeout-graceful-shutdown 10"]
+# Command to run the addon dynamically supporting optional auto-update + optional TLS
+CMD ["sh", "-c", "if [ \"$AUTO_UPDATE\" = \"true\" ]; then echo 'Auto-update enabled. Cloning latest code...'; git clone --depth=1 ${GITHUB_REPO_URL:-https://github.com/SunilRoy-dev/stremio-telegram-debrid.git} /tmp/app && cp -r /tmp/app/* . && rm -rf /tmp/app && pip install --no-cache-dir --user -r requirements.txt tgcrypto; fi; SSL_ARGS=\"\"; if [ -n \"$SSL_CERTFILE\" ] && [ -n \"$SSL_KEYFILE\" ]; then SSL_ARGS=\"--ssl-certfile $SSL_CERTFILE --ssl-keyfile $SSL_KEYFILE\"; echo \"TLS enabled via SSL_CERTFILE/SSL_KEYFILE\"; fi; exec uvicorn addon:app --host 0.0.0.0 --port ${PORT:-7860} --timeout-keep-alive 300 --timeout-graceful-shutdown 10 $SSL_ARGS"]
 
