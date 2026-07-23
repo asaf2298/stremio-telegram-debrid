@@ -1,5 +1,7 @@
 import logging
 import asyncio
+import secrets
+import re
 
 # Fix Pyrogram event loop crash on Python 3.12/3.14
 try:
@@ -52,21 +54,34 @@ async def lifespan(app: FastAPI):
         print("   GitHub: https://github.com/SunilRoy-dev/stremio-telegram-debrid")
         print("   For educational and personal testing only.")
         print("=" * 60 + "\n")
-        
-        Config.validate()
-        await tg_client_manager.start()
+
+        # Always bring up HTTP so Stremio can fetch manifest.json even if Telegram
+        # auth is temporarily broken. Media routes reconnect lazily on demand.
+        try:
+            Config.validate()
+            await tg_client_manager.start()
+        except Exception as e:
+            logger.error(
+                "Telegram client failed to start during boot: %s. "
+                "Serving HTTP anyway; streams will retry on first request.",
+                e,
+            )
         yield
     finally:
         await tg_client_manager.stop()
 
 app = FastAPI(lifespan=lifespan)
 
+# Stremio Web (and browsers) need CORS. Do NOT pair allow_origins=["*"] with
+# allow_credentials=True — browsers reject that combination as "Failed to fetch".
+# allow_private_network is required when web.stremio.com installs a local/LAN addon.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_private_network=True,
 )
 
 @app.middleware("http")
@@ -75,6 +90,52 @@ async def disable_proxy_buffering(request: Request, call_next):
     if "/stream/" in request.url.path:
         response.headers["X-Accel-Buffering"] = "no"
     return response
+
+
+def api_key_matches(provided: str) -> bool:
+    expected = Config.API_KEY or ""
+    provided = provided or ""
+    if not expected:
+        return True
+    return secrets.compare_digest(provided, expected)
+
+
+def require_api_key(provided: str = "") -> None:
+    if Config.API_KEY and not api_key_matches(provided):
+        raise HTTPException(status_code=403, detail="Unauthorized: Invalid API Key")
+
+
+def content_disposition_inline(filename: str) -> str:
+    """Build a safe Content-Disposition value (prevents header injection)."""
+    safe = re.sub(r'[\r\n"\\\\]', "_", filename or "file")
+    safe = safe[:200] or "file"
+    encoded = urllib.parse.quote(safe)
+    return f"inline; filename=\"{safe}\"; filename*=UTF-8''{encoded}"
+
+
+def assert_chat_allowed(chat_id) -> None:
+    """Prevent IDOR: only configured Telegram channels may be streamed."""
+    allowed = tg_client_manager.get_channel_ids()
+    if not allowed:
+        raise HTTPException(status_code=403, detail="No channels configured")
+
+    requested = {str(chat_id).strip()}
+    try:
+        requested.add(str(int(chat_id)))
+    except (TypeError, ValueError):
+        pass
+
+    allowed_ids = set()
+    for cid in allowed:
+        allowed_ids.add(str(cid).strip())
+        try:
+            allowed_ids.add(str(int(cid)))
+        except (TypeError, ValueError):
+            pass
+
+    if requested.isdisjoint(allowed_ids):
+        logger.warning("Blocked stream request for unauthorized chat_id=%s", chat_id)
+        raise HTTPException(status_code=403, detail="Chat not allowed")
 
 
 def group_tg_messages(messages: list) -> list:
@@ -117,16 +178,13 @@ def group_tg_messages(messages: list) -> list:
     return results
 
 def verify_api_key(request: Request):
-    if Config.API_KEY:
-        api_key = request.query_params.get("api_key", "") or request.path_params.get("api_key", "")
-        if api_key != Config.API_KEY:
-            raise HTTPException(status_code=403, detail="Unauthorized: Invalid API Key")
+    api_key = request.query_params.get("api_key", "") or request.path_params.get("api_key", "")
+    require_api_key(api_key)
 
 def get_manifest(api_key: str = ""):
-    query_suffix = f"?api_key={api_key}" if api_key else ""
     return {
         "id": "community.telegram.stremio.addon",
-        "version": "1.0.0",
+        "version": "1.0.1",
         "name": "Telegram Addon by SunilRoy-dev",
         "description": "Personal Telegram streaming proxy. For educational & personal testing only. Do not use for unauthorized hosting of copyrighted media.",
         "logo": "https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg",
@@ -547,9 +605,17 @@ async def landing(request: Request):
                         Local Deployment Troubleshooting
                     </summary>
                     <div class="troubleshoot-content">
-                        This error <strong>only occurs in local HTTP deployments</strong>. If you deploy this project to a secure public HTTPS server (such as Hugging Face Spaces, Render, or Koyeb), this installation button will work <strong>flawlessly</strong>.
+                        This error commonly happens with <strong>local HTTP</strong> installs or missing API keys. Deployed HTTPS hosts (Render, Koyeb, Hugging Face) usually work with the install buttons.
                         <br><br>
-                        For local deployments, Stremio's desktop protocol handler (<strong>stremio://</strong>) strips local ports and forces HTTPS, resulting in connection failure.
+                        <strong>If you see "Failed to fetch":</strong>
+                        <ol>
+                            <li>Confirm the server is running and open <code>/health</code> — <code>status</code> should be <code>ok</code>.</li>
+                            <li>If you set an <strong>API_KEY</strong>, enter it above so the manifest URL includes <code>/YOUR_KEY/manifest.json</code>.</li>
+                            <li>Use HTTPS for public installs. For local installs, paste the manifest URL into the Stremio Desktop app Add-ons box (do not rely on the <code>stremio://</code> button for localhost).</li>
+                            <li>Stremio Web → local addon now allows private-network CORS; still prefer Desktop paste for reliability.</li>
+                        </ol>
+                        <br>
+                        For local deployments, Stremio's desktop protocol handler (<strong>stremio://</strong>) may strip local ports and force HTTPS.
                         <br><br>
                         <strong>How to install locally:</strong>
                         <ol>
@@ -676,10 +742,20 @@ async def landing(request: Request):
     """
     return HTMLResponse(content=html_content)
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "telegram": bool(getattr(tg_client_manager, "is_running", False)),
+        "addon_url": Config.ADDON_URL,
+        "api_key_required": bool(Config.API_KEY),
+    }
+
 @app.api_route("/manifest.json", methods=["GET", "HEAD"])
 @app.api_route("/{api_key}/manifest.json", methods=["GET", "HEAD"])
 async def manifest_endpoint(api_key: str = ""):
-    if Config.API_KEY and api_key != Config.API_KEY:
+    if Config.API_KEY and not api_key_matches(api_key):
+        # Keep CORS-friendly JSON body so Stremio/Web shows auth error, not opaque fetch failure
         return JSONResponse({"detail": "Unauthorized: Invalid API Key"}, status_code=403)
     return get_manifest(api_key)
 
@@ -955,10 +1031,8 @@ async def stream_handler(
     request: Request,
     api_key: str = ""
 ):
-    if Config.API_KEY:
-        actual_key = api_key or request.query_params.get("api_key", "")
-        if actual_key != Config.API_KEY:
-            raise HTTPException(status_code=403, detail="Unauthorized")
+    actual_key = api_key or request.query_params.get("api_key", "")
+    require_api_key(actual_key)
         
     streams = []
     query_param = f"?api_key={api_key}" if api_key else ""
@@ -1303,10 +1377,8 @@ async def subtitles_handler(
     extra: str = None,
     api_key: str = ""
 ):
-    if Config.API_KEY:
-        actual_key = api_key or request.query_params.get("api_key", "")
-        if actual_key != Config.API_KEY:
-            raise HTTPException(status_code=403, detail="Unauthorized")
+    actual_key = api_key or request.query_params.get("api_key", "")
+    require_api_key(actual_key)
         
     subtitles = []
     
@@ -1379,8 +1451,8 @@ async def tg_subtitle_proxy(
     request: Request,
     api_key: str = ""
 ):
-    if Config.API_KEY and api_key != Config.API_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    require_api_key(api_key)
+    assert_chat_allowed(chat_id)
         
     try:
         try:
@@ -1409,7 +1481,7 @@ async def tg_subtitle_proxy(
         content_type = "text/plain"
         
     headers = {
-        "Content-Disposition": f'inline; filename="{filename}"',
+        "Content-Disposition": content_disposition_inline(filename),
         "Access-Control-Allow-Origin": "*",
         "Content-Length": str(media.file_size),
     }
@@ -1443,8 +1515,15 @@ async def tg_stream_proxy(
     request: Request,
     api_key: str = ""
 ):
-    if Config.API_KEY and api_key != Config.API_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    require_api_key(api_key)
+    assert_chat_allowed(chat_id)
+
+    if not tg_client_manager.is_running or not tg_client_manager.client:
+        try:
+            await tg_client_manager.start()
+        except Exception as e:
+            logger.error(f"Telegram client unavailable for stream: {e}")
+            raise HTTPException(status_code=503, detail="Telegram client unavailable")
         
     try:
         try:
@@ -1498,10 +1577,11 @@ async def tg_stream_proxy(
     headers = {
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
-        "Content-Disposition": f'inline; filename="{filename}"',
+        "Content-Disposition": content_disposition_inline(filename),
         "Connection": "keep-alive",
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
+        "Access-Control-Allow-Origin": "*",
     }
     
     # Content-Range must only be sent on 206
@@ -1587,8 +1667,8 @@ async def tg_split_stream_proxy(
     request: Request,
     api_key: str = ""
 ):
-    if Config.API_KEY and api_key != Config.API_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    require_api_key(api_key)
+    assert_chat_allowed(chat_id)
         
     msg_id_list = [int(x) for x in message_ids.split(",") if x.strip().isdigit()]
     if not msg_id_list:
@@ -1655,7 +1735,7 @@ async def tg_split_stream_proxy(
     headers = {
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
-        "Content-Disposition": f'inline; filename="{filename}"',
+        "Content-Disposition": content_disposition_inline(filename),
         "Connection": "keep-alive",
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
@@ -1739,8 +1819,8 @@ async def tg_zip_stream_proxy(
     request: Request,
     api_key: str = ""
 ):
-    if Config.API_KEY and api_key != Config.API_KEY:
-        raise HTTPException(status_code=403, detail="Unauthorized")
+    require_api_key(api_key)
+    assert_chat_allowed(chat_id)
         
     msg_id_list = [int(x) for x in message_ids.split(",") if x.strip().isdigit()]
     if not msg_id_list:
@@ -1808,7 +1888,7 @@ async def tg_zip_stream_proxy(
     headers = {
         "Accept-Ranges": "bytes",
         "Content-Length": str(content_length),
-        "Content-Disposition": f'inline; filename="{filename}"',
+        "Content-Disposition": content_disposition_inline(filename),
         "Connection": "keep-alive",
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
