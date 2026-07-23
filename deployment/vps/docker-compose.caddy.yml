@@ -1,0 +1,57 @@
+# HTTPS reverse proxy for a VPS (DigitalOcean, etc.)
+#
+# Why: Stremio remote installs require HTTPS. Uvicorn alone speaks HTTP, so
+# https://YOUR_IP:7860/... produces "Invalid HTTP request received" / Failed to fetch.
+#
+# Prerequisites:
+#   1. A domain (e.g. stremio-tg.example.com) with an A record pointing to this VPS
+#   2. Ports 80 and 443 open in the firewall
+#   3. A .env in this directory (copy from ../../.env.example)
+#
+# Usage (from repo root or this folder):
+#   export ADDON_DOMAIN=stremio-tg.example.com
+#   # In .env set: ADDON_URL=https://stremio-tg.example.com
+#   docker compose -f deployment/vps/docker-compose.caddy.yml up -d --build
+
+services:
+  addon:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: tg-stremio-addon
+    env_file:
+      - .env
+    environment:
+      - PORT=7860
+      # Public HTTPS URL clients/Stremio should use (no :7860)
+      - ADDON_URL=https://${ADDON_DOMAIN}
+    expose:
+      - "7860"
+    restart: unless-stopped
+    networks:
+      - addon_net
+
+  caddy:
+    image: caddy:2
+    container_name: tg-stremio-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - ADDON_DOMAIN=${ADDON_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - addon
+    networks:
+      - addon_net
+
+networks:
+  addon_net:
+
+volumes:
+  caddy_data:
+  caddy_config:

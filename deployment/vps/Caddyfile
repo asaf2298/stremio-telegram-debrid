@@ -1,0 +1,4 @@
+{$ADDON_DOMAIN} {
+	encode gzip
+	reverse_proxy addon:7860
+}

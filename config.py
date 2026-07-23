@@ -1,10 +1,14 @@
 import os
+import logging
+from urllib.parse import urlparse
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
+
+logger = logging.getLogger("config")
 
 class Config:
     PORT = int(os.getenv("PORT", 7860))
@@ -20,6 +24,10 @@ class Config:
 
     TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
     LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
+
+    # Optional direct TLS for uvicorn (prefer a reverse proxy like Caddy/Traefik in production)
+    SSL_CERTFILE = os.getenv("SSL_CERTFILE", "")
+    SSL_KEYFILE = os.getenv("SSL_KEYFILE", "")
 
     @classmethod
     def validate(cls):
@@ -59,3 +67,32 @@ class Config:
                     cls.LOG_CHANNEL_ID = int(val)
                 except ValueError:
                     pass
+
+        cls.warn_tls_misconfig()
+
+    @classmethod
+    def warn_tls_misconfig(cls):
+        """Stremio remote installs require HTTPS. Plain uvicorn is HTTP-only."""
+        parsed = urlparse(cls.ADDON_URL or "")
+        scheme = (parsed.scheme or "").lower()
+        host = (parsed.hostname or "").lower()
+        local_hosts = {"localhost", "127.0.0.1", "::1"}
+        has_direct_tls = bool(cls.SSL_CERTFILE and cls.SSL_KEYFILE)
+
+        if scheme == "https" and host and host not in local_hosts and not has_direct_tls:
+            logger.warning(
+                "ADDON_URL is %s but this process speaks plain HTTP unless you put "
+                "Caddy/Traefik/nginx (or SSL_CERTFILE/SSL_KEYFILE) in front. "
+                "Using https:// against port %s causes uvicorn "
+                "'Invalid HTTP request received' and Stremio 'Failed to fetch'. "
+                "See deployment/vps/docker-compose.caddy.yml",
+                cls.ADDON_URL,
+                cls.PORT,
+            )
+        elif scheme == "http" and host and host not in local_hosts:
+            logger.warning(
+                "ADDON_URL is plain HTTP on a public host (%s). Stremio will usually "
+                "force HTTPS for remote addons and fail with 'Failed to fetch'. "
+                "Point a domain at this server and terminate TLS with Caddy/Traefik.",
+                host,
+            )
