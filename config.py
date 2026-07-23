@@ -78,6 +78,9 @@ class Config:
         host = (parsed.hostname or "").lower()
         local_hosts = {"localhost", "127.0.0.1", "::1"}
         has_direct_tls = bool(cls.SSL_CERTFILE and cls.SSL_KEYFILE)
+        behind_proxy = os.getenv("BEHIND_REVERSE_PROXY", "").lower() in {"1", "true", "yes"}
+        if behind_proxy:
+            return
 
         if scheme == "https" and host and host not in local_hosts and not has_direct_tls:
             logger.warning(
