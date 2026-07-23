@@ -1,5 +1,7 @@
 version: '3.8'
 
+# Plain HTTP (OK for localhost only). For a public VPS use:
+#   deployment/vps/docker-compose.caddy.yml
 services:
   addon:
     build: .

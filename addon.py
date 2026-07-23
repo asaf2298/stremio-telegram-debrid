@@ -66,6 +66,11 @@ async def lifespan(app: FastAPI):
                 "Serving HTTP anyway; streams will retry on first request.",
                 e,
             )
+            # Still surface TLS guidance even when Telegram boot fails
+            try:
+                Config.warn_tls_misconfig()
+            except Exception:
+                pass
         yield
     finally:
         await tg_client_manager.stop()
@@ -211,6 +216,28 @@ async def landing(request: Request):
     
     web_stremio_url = f"https://web.stremio.com/#/addons?addon={urllib.parse.quote(manifest_url)}"
     escaped_web_stremio_url = markupsafe.escape(web_stremio_url)
+
+    # Detect common misconfig: public HTTP or https://IP:port without a TLS proxy
+    host = (request.url.hostname or "").lower()
+    scheme = (request.url.scheme or "http").lower()
+    forwarded = (request.headers.get("x-forwarded-proto") or "").lower()
+    effective_scheme = forwarded or scheme
+    is_local = host in {"localhost", "127.0.0.1", "::1"}
+    tls_warning = ""
+    if not is_local and effective_scheme == "http":
+        tls_warning = """
+                <div class="tls-warning">
+                    <strong>HTTPS required for Stremio</strong>
+                    This page is being served over plain <code>http://</code> on a public host.
+                    Stremio will try <code>https://</code>, uvicorn will log
+                    <code>Invalid HTTP request received</code>, and install fails with
+                    <strong>Failed to fetch</strong>.
+                    Fix: point a domain at this VPS and run
+                    <code>deployment/vps/docker-compose.caddy.yml</code>
+                    (or Traefik), then set <code>ADDON_URL=https://your.domain</code>
+                    — do not use <code>https://IP:7860</code> against bare uvicorn.
+                </div>
+        """
     
     api_key_section = ""
     if Config.API_KEY:
@@ -545,6 +572,22 @@ async def landing(request: Request):
                     color: var(--text-muted);
                     font-style: normal;
                 }}
+                .tls-warning {{
+                    background: #422006;
+                    border: 1px solid #f59e0b;
+                    color: #fde68a;
+                    border-radius: 8px;
+                    padding: 14px 16px;
+                    margin-bottom: 20px;
+                    font-size: 0.85rem;
+                    line-height: 1.5;
+                }}
+                .tls-warning code {{
+                    background: #1c1917;
+                    padding: 1px 5px;
+                    border-radius: 4px;
+                    font-size: 0.8rem;
+                }}
             </style>
         </head>
         <body>
@@ -576,6 +619,7 @@ async def landing(request: Request):
                     <p>A self-hosted Stremio addon proxy to stream videos, audios, and segmented archive parts directly from Telegram.</p>
                 </div>
                 
+                {tls_warning}
                 {api_key_section}
                 <div class="url-section">
                     <div class="section-title">Addon Manifest URL</div>
@@ -609,6 +653,7 @@ async def landing(request: Request):
                         <br><br>
                         <strong>If you see "Failed to fetch":</strong>
                         <ol>
+                            <li>If logs show <code>Invalid HTTP request received</code>, you called <code>https://</code> on plain uvicorn (HTTP only). Use a domain + Caddy/Traefik, not <code>https://IP:7860</code>.</li>
                             <li>Confirm the server is running and open <code>/health</code> — <code>status</code> should be <code>ok</code>.</li>
                             <li>If you set an <strong>API_KEY</strong>, enter it above so the manifest URL includes <code>/YOUR_KEY/manifest.json</code>.</li>
                             <li>Use HTTPS for public installs. For local installs, paste the manifest URL into the Stremio Desktop app Add-ons box (do not rely on the <code>stremio://</code> button for localhost).</li>
@@ -743,12 +788,26 @@ async def landing(request: Request):
     return HTMLResponse(content=html_content)
 
 @app.get("/health")
-async def health():
+async def health(request: Request):
+    parsed = urllib.parse.urlparse(Config.ADDON_URL or "")
+    host = (request.url.hostname or "").lower()
+    forwarded = (request.headers.get("x-forwarded-proto") or "").lower()
+    effective_scheme = forwarded or (request.url.scheme or "http")
+    public_http = effective_scheme == "http" and host not in {"localhost", "127.0.0.1", "::1"}
     return {
         "status": "ok",
         "telegram": bool(getattr(tg_client_manager, "is_running", False)),
         "addon_url": Config.ADDON_URL,
         "api_key_required": bool(Config.API_KEY),
+        "request_scheme": effective_scheme,
+        "tls_ok_for_stremio": not public_http,
+        "hint": (
+            None
+            if not public_http
+            else "Stremio needs HTTPS. Put Caddy/Traefik in front (deployment/vps/docker-compose.caddy.yml). "
+                 "https://IP:7860 against bare uvicorn causes 'Invalid HTTP request received'."
+        ),
+        "addon_url_scheme": parsed.scheme or "",
     }
 
 @app.api_route("/manifest.json", methods=["GET", "HEAD"])
