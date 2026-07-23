@@ -1,9 +1,54 @@
 import re
+import time
 import logging
-import unicodedata
+from collections import OrderedDict
 import httpx
 
 logger = logging.getLogger("utils")
+
+
+class BoundedTTLCache:
+    """A tiny dict-like cache with a max size (LRU eviction) and per-entry TTL.
+
+    Prevents unbounded memory growth from caches keyed on user-controlled
+    input (search queries, chat_id/message_id pairs, etc).
+    """
+
+    def __init__(self, maxsize: int = 1000, ttl: float = 1800):
+        self.maxsize = maxsize
+        self.ttl = ttl
+        self._data = OrderedDict()
+
+    def get(self, key):
+        entry = self._data.get(key)
+        if entry is None:
+            return None
+        ts, value = entry
+        if time.time() - ts > self.ttl:
+            self._data.pop(key, None)
+            return None
+        self._data.move_to_end(key)
+        return value
+
+    def get_with_age(self, key):
+        """Return (timestamp, value) without TTL enforcement, or None."""
+        entry = self._data.get(key)
+        if entry is None:
+            return None
+        self._data.move_to_end(key)
+        return entry
+
+    def set(self, key, value, timestamp=None):
+        self._data[key] = (timestamp if timestamp is not None else time.time(), value)
+        self._data.move_to_end(key)
+        while len(self._data) > self.maxsize:
+            self._data.popitem(last=False)
+
+    def __contains__(self, key):
+        return self.get(key) is not None
+
+    def __len__(self):
+        return len(self._data)
 
 def format_size(bytes_size: int) -> str:
     if not bytes_size:
@@ -191,7 +236,7 @@ def parse_split_info(filename: str) -> tuple:
         
     return None, None
 
-_metadata_cache = {}
+_metadata_cache = BoundedTTLCache(maxsize=2000, ttl=6 * 3600)
 
 async def get_metadata_from_cinemeta(meta_type: str, imdb_id: str) -> dict:
     if not meta_type or not imdb_id:
@@ -202,8 +247,9 @@ async def get_metadata_from_cinemeta(meta_type: str, imdb_id: str) -> dict:
         return {}
 
     cache_key = f"{meta_type}:{imdb_id}"
-    if cache_key in _metadata_cache:
-        return _metadata_cache[cache_key]
+    cached = _metadata_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     imdb_clean = imdb_id.split(":")[0]
     url = f"https://v3-cinemeta.strem.io/meta/{meta_type}/{imdb_clean}.json"
@@ -222,7 +268,7 @@ async def get_metadata_from_cinemeta(meta_type: str, imdb_id: str) -> dict:
                         "genres": meta.get("genres", []),
                         "poster": meta.get("poster")
                     }
-                    _metadata_cache[cache_key] = result
+                    _metadata_cache.set(cache_key, result)
                     return result
     except Exception as e:
         logger.error(f"Cinemeta metadata lookup failed: {e}")
@@ -233,65 +279,3 @@ VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.t
 
 def is_video_file(filename: str) -> bool:
     return filename.lower().endswith(VIDEO_EXTENSIONS)
-
-def normalize_title(title: str) -> str:
-    if not title:
-        return ""
-    t = "".join(c for c in unicodedata.normalize('NFD', title) if unicodedata.category(c) != 'Mn')
-    t = t.lower()
-    t = re.sub(r'[^a-z0-9\s]', ' ', t)
-    t = re.sub(r'\bii\b', '2', t)
-    t = re.sub(r'\biii\b', '3', t)
-    t = re.sub(r'\biv\b', '4', t)
-    t = re.sub(r'\bv\b', '5', t)
-    t = re.sub(r'\bvi\b', '6', t)
-    t = re.sub(r'\bvii\b', '7', t)
-    t = re.sub(r'\bviii\b', '8', t)
-    t = re.sub(r'\bix\b', '9', t)
-    t = re.sub(r'\bx\b', '10', t)
-    t = re.sub(r'\s+', ' ', t).strip()
-    return t
-
-def _clean_title_prefix(filename: str) -> str:
-    if not filename:
-        return ""
-    fn_lower = filename.lower()
-    first_match_idx = len(filename)
-    
-    # Locate season/episode split point
-    all_patterns = _SEASON_EPISODE_PATTERNS + _EPISODE_SEASON_PATTERNS + _STANDALONE_EPISODE_PATTERNS
-    for pat in all_patterns:
-        m = pat.search(fn_lower)
-        if m:
-            first_match_idx = min(first_match_idx, m.start())
-            
-    # Locate year split point
-    year_match = re.search(r'\b(19\d{2}|20[0-2]\d)\b', filename)
-    if year_match:
-        first_match_idx = min(first_match_idx, year_match.start())
-        
-    prefix = filename[:first_match_idx]
-    return prefix.strip()
-
-def matches_title(filename: str, title: str) -> bool:
-    if not title:
-        return True
-        
-    norm_title = normalize_title(title)
-    prefix = _clean_title_prefix(filename)
-    norm_prefix = normalize_title(prefix)
-    
-    if not norm_prefix:
-        norm_prefix = normalize_title(filename)
-        
-    if norm_title in norm_prefix:
-        return True
-        
-    # Check if all major words of the title are in the prefix
-    words = [w for w in norm_title.split() if w not in ('a', 'an', 'the', 'and', 'or', 'of', 'in', 'to', 'for', 'with')]
-    if not words:
-        words = norm_title.split()
-        
-    return all(word in norm_prefix for word in words)
-
-

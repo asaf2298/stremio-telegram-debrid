@@ -1,4 +1,3 @@
-import time
 import logging
 import asyncio
 import functools
@@ -16,7 +15,7 @@ from pyrogram.errors import VolumeLocNotFound, CDNFileHashMismatch
 from pyrogram.crypto import aes
 import pyrogram
 from config import Config
-from utils import parse_split_info
+from utils import parse_split_info, BoundedTTLCache
 
 logger = logging.getLogger("tg_client")
 
@@ -268,9 +267,12 @@ class TelegramClientManager:
     def __init__(self):
         self.client = None
         self.is_running = False
-        self._search_cache = {}
-        self._message_cache = {}
-        self._log_cache = {}
+        # Bounded caches: these are keyed on user-controlled search queries and
+        # chat_id/message_id pairs, so an unbounded dict would let a caller
+        # grow server memory indefinitely.
+        self._search_cache = BoundedTTLCache(maxsize=500, ttl=Config.CACHE_TTL)
+        self._message_cache = BoundedTTLCache(maxsize=5000, ttl=Config.CACHE_TTL)
+        self._log_cache = BoundedTTLCache(maxsize=5000, ttl=900)
 
     def initialize(self):
         Config.validate()
@@ -368,13 +370,12 @@ class TelegramClientManager:
             return
             
         key = (chat_id, message_id)
-        now = time.time()
-        
+
         # Avoid duplicate logs for the same file within 15 mins
-        if key in self._log_cache and now - self._log_cache[key] < 900:
+        if self._log_cache.get(key) is not None:
             return
-                
-        self._log_cache[key] = now
+
+        self._log_cache.set(key, True)
         
         try:
             import datetime
@@ -407,10 +408,14 @@ class TelegramClientManager:
                 
             time_str = local_dt.strftime("%Y-%m-%d %H:%M:%S")
             year_str = local_dt.strftime("%Y")
-            
+
+            # Escape backticks so a crafted filename can't break out of the
+            # code span or inject extra Markdown into the log channel message.
+            safe_filename = str(filename or "").replace("`", "'").replace("\r", "").replace("\n", " ")[:300]
+
             message_text = (
                 f"🎬 **Media Stream Log**\n\n"
-                f"📁 **File Name:** `{filename}`\n"
+                f"📁 **File Name:** `{safe_filename}`\n"
                 f"📅 **Date & Time:** `{time_str}`\n"
                 f"📆 **Year:** `{year_str}`\n"
                 f"💬 **Source Channel:** `{chat_id}`\n"
@@ -431,11 +436,9 @@ class TelegramClientManager:
         query_str = str(query).strip() if query else ""
         
         cache_key = f"{query_str}:{limit}"
-        now = time.time()
-        if cache_key in self._search_cache:
-            cached_time, cached_results = self._search_cache[cache_key]
-            if now - cached_time < Config.CACHE_TTL:
-                return cached_results
+        cached_results = self._search_cache.get(cache_key)
+        if cached_results is not None:
+            return cached_results
 
         chat_ids = self.get_channel_ids()
         results = []
@@ -496,7 +499,7 @@ class TelegramClientManager:
         final_results.sort(key=lambda m: m.date, reverse=True)
         final_results = final_results[:limit]
         
-        self._search_cache[cache_key] = (now, final_results)
+        self._search_cache.set(cache_key, final_results)
         return final_results
 
     async def get_message(self, message_id: int, chat_id: int = None) -> Message:
@@ -506,15 +509,13 @@ class TelegramClientManager:
         target_chat = chat_id if chat_id is not None else self.get_channel_ids()[0]
         
         cache_key = f"{target_chat}:{message_id}"
-        now = time.time()
-        if cache_key in self._message_cache:
-            cached_time, cached_msg = self._message_cache[cache_key]
-            if now - cached_time < Config.CACHE_TTL:
-                return cached_msg
+        cached_msg = self._message_cache.get(cache_key)
+        if cached_msg is not None:
+            return cached_msg
 
         try:
             msg = await self.client.get_messages(chat_id=target_chat, message_ids=message_id)
-            self._message_cache[cache_key] = (now, msg)
+            self._message_cache.set(cache_key, msg)
             return msg
         except Exception as e:
             logger.error(f"Failed to fetch message {message_id} in channel {target_chat}: {e}")
