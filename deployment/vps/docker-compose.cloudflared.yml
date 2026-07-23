@@ -1,0 +1,47 @@
+# Zero-config HTTPS via a Cloudflare Tunnel "quick tunnel" — no domain, no open
+# 80/443 ports, and no DNS-blocklist risk (unlike sslip.io/nip.io/DuckDNS, which
+# are commonly blocked by Pi-hole/AdGuard/NextDNS/ISP DNS security lists because
+# IP-embedding wildcard DNS is a well-known SSRF/DNS-rebinding bypass technique).
+#
+# Trade-off: an anonymous "quick tunnel" hostname (*.trycloudflare.com) is not
+# guaranteed stable across restarts — Cloudflare explicitly says these are for
+# testing, not production. For a stable long-term URL, create a named tunnel
+# with a free Cloudflare account + your own domain instead:
+# https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/
+#
+# Usage:
+#   docker compose -f deployment/vps/docker-compose.cloudflared.yml up -d --build
+#   docker compose -f deployment/vps/docker-compose.cloudflared.yml logs cloudflared
+#     -> copy the printed https://xxxx.trycloudflare.com URL
+#   Set ADDON_URL in .env to that URL, then:
+#   docker compose -f deployment/vps/docker-compose.cloudflared.yml up -d addon
+
+services:
+  addon:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: tg-stremio-addon
+    env_file:
+      - .env
+    environment:
+      - PORT=7860
+      - BEHIND_REVERSE_PROXY=true
+    expose:
+      - "7860"
+    restart: unless-stopped
+    networks:
+      - addon_net
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: tg-stremio-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://addon:7860
+    depends_on:
+      - addon
+    networks:
+      - addon_net
+
+networks:
+  addon_net:

@@ -26,7 +26,6 @@ from utils import (
     get_search_query_from_filename,
     parse_split_info,
     is_video_file,
-    matches_title
 )
 from zip_helper import (
     list_zip_files,
@@ -35,9 +34,6 @@ from zip_helper import (
     zip_compressed_generator
 )
 from search_utils import VideoMatcher, parse_video_resolution, get_resolution_score
-import anyio
-
-
 
 logging.basicConfig(
     level=logging.INFO,
@@ -110,6 +106,14 @@ def require_api_key(provided: str = "") -> None:
         raise HTTPException(status_code=403, detail="Unauthorized: Invalid API Key")
 
 
+def log_safe(value: str, max_len: int = 200) -> str:
+    """Strip CR/LF from user-controlled values before they hit the log stream
+    (prevents log forging / injected fake log lines)."""
+    if not value:
+        return value
+    return re.sub(r'[\r\n]', ' ', str(value))[:max_len]
+
+
 def content_disposition_inline(filename: str) -> str:
     """Build a safe Content-Disposition value (prevents header injection)."""
     safe = re.sub(r'[\r\n"\\\\]', "_", filename or "file")
@@ -141,6 +145,62 @@ def assert_chat_allowed(chat_id) -> None:
     if requested.isdisjoint(allowed_ids):
         logger.warning("Blocked stream request for unauthorized chat_id=%s", chat_id)
         raise HTTPException(status_code=403, detail="Chat not allowed")
+
+
+MAX_SPLIT_PARTS = 200
+
+
+def parse_message_ids(message_ids: str) -> list:
+    """Parse a comma-separated list of Telegram message ids, capped to avoid
+    a single request forcing hundreds of sequential Telegram API calls."""
+    ids = [int(x) for x in message_ids.split(",") if x.strip().isdigit()]
+    if len(ids) > MAX_SPLIT_PARTS:
+        raise HTTPException(status_code=400, detail=f"Too many parts (max {MAX_SPLIT_PARTS})")
+    return ids
+
+
+def parse_range_header(range_header: str, total_size: int) -> tuple:
+    """Parse a Range header into (start, end, status_code), clamped to the
+    file size. Raises HTTPException(416) for an unsatisfiable range."""
+    start, end = 0, total_size - 1
+    status_code = 200
+
+    if range_header:
+        try:
+            bytes_range = range_header.replace("bytes=", "").split("-")
+            if bytes_range[0]:
+                start = int(bytes_range[0])
+            if len(bytes_range) > 1 and bytes_range[1]:
+                end = int(bytes_range[1])
+        except ValueError:
+            pass
+        else:
+            status_code = 206
+
+    if start < 0 or start >= total_size or start > end:
+        raise HTTPException(
+            status_code=416,
+            detail="Range Not Satisfiable",
+            headers={"Content-Range": f"bytes */{total_size}"},
+        )
+    end = min(end, total_size - 1)
+    return start, end, status_code
+
+
+def parse_tgfile_chat_and_msgids(base_id: str) -> tuple:
+    """Extract (chat_id, msg_ids_csv) from a tgfile_* catalog/stream id.
+
+    Raises HTTPException(400) on malformed ids instead of letting IndexError
+    bubble up as an unhandled 500.
+    """
+    try:
+        if base_id.startswith("tgfile_splitzip_") or base_id.startswith("tgfile_split_") or base_id.startswith("tgfile_zip_"):
+            parts = base_id.split("_")
+            return parts[2], parts[3]
+        parts = base_id.split("_")
+        return parts[1], parts[2]
+    except IndexError:
+        raise HTTPException(status_code=400, detail=f"Malformed id: {base_id}")
 
 
 def group_tg_messages(messages: list) -> list:
@@ -977,7 +1037,9 @@ async def meta_handler(type: str, meta_id: str, api_key: str = ""):
             chat_id_val = int(chat_id)
         except ValueError:
             chat_id_val = chat_id
-            
+
+        assert_chat_allowed(chat_id_val)
+
         msg_id_list = [int(x) for x in msg_ids_str.split(",") if x.strip().isdigit()]
         
         messages = []
@@ -1051,7 +1113,7 @@ async def find_subtitles_for_video(video_filename: str, api_key: str = "", cache
             try:
                 search_results = await tg_client_manager.search_messages(query=query, limit=20)
             except Exception as e:
-                logger.error(f"Subtitle search failed for '{query}': {e}")
+                logger.error(f"Subtitle search failed for '{log_safe(query)}': {e}")
                 
     seen_msg_ids = set()
     for msg in search_results:
@@ -1098,35 +1160,19 @@ async def stream_handler(
 
     if stream_id.startswith("tgfile_"):
         if "//" in stream_id:
-            base_stream_id, zip_entry_filename = stream_id.split("//", 1)
-            is_split = False
-            if base_stream_id.startswith("tgfile_splitzip_"):
-                is_split = True
-                parts = base_stream_id.split("_")
-                chat_id = parts[2]
-                msg_ids = parts[3]
-            elif base_stream_id.startswith("tgfile_split_"):
-                is_split = True
-                parts = base_stream_id.split("_")
-                chat_id = parts[2]
-                msg_ids = parts[3]
-            elif base_stream_id.startswith("tgfile_zip_"):
-                parts = base_stream_id.split("_")
-                chat_id = parts[2]
-                msg_ids = parts[3]
-            else:
-                parts = base_stream_id.split("_")
-                chat_id = parts[1]
-                msg_ids = parts[2]
-                
             try:
-                chat_id_val = int(chat_id)
-            except ValueError:
-                chat_id_val = chat_id
-                
-            msg_id_list = [int(x) for x in msg_ids.split(",") if x.strip().isdigit()]
-            
-            try:
+                base_stream_id, zip_entry_filename = stream_id.split("//", 1)
+                chat_id, msg_ids = parse_tgfile_chat_and_msgids(base_stream_id)
+
+                try:
+                    chat_id_val = int(chat_id)
+                except ValueError:
+                    chat_id_val = chat_id
+
+                assert_chat_allowed(chat_id_val)
+
+                msg_id_list = [int(x) for x in msg_ids.split(",") if x.strip().isdigit()]
+
                 messages = []
                 for msg_id in msg_id_list:
                     msg = await tg_client_manager.get_message(msg_id, chat_id=chat_id_val)
@@ -1153,6 +1199,8 @@ async def stream_handler(
                             "notWebReady": True,
                         }
                     })
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(f"Failed resolving zip stream for {stream_id}: {e}")
         elif stream_id.startswith("tgfile_split_"):
@@ -1166,6 +1214,8 @@ async def stream_handler(
                         chat_id_val = int(chat_id)
                     except ValueError:
                         chat_id_val = chat_id
+
+                    assert_chat_allowed(chat_id_val)
                     
                     first_msg = await tg_client_manager.get_message(msg_id_list[0], chat_id=chat_id_val)
                     media = first_msg.video or first_msg.document or first_msg.audio
@@ -1204,6 +1254,9 @@ async def stream_handler(
                         chat_id_val = int(chat_id)
                     except ValueError:
                         chat_id_val = chat_id
+
+                    assert_chat_allowed(chat_id_val)
+
                     msg = await tg_client_manager.get_message(int(msg_id), chat_id=chat_id_val)
                     media = msg.video or msg.document or msg.audio
                     file_name = getattr(media, "file_name", "video.mp4") or "video.mp4"
@@ -1228,13 +1281,19 @@ async def stream_handler(
         imdb_id = stream_id
         season = None
         episode = None
-        
-        if ":" in stream_id:
-            parts = stream_id.split(":")
-            imdb_id = parts[0]
-            season = int(parts[1])
-            episode = int(parts[2])
-            
+
+        try:
+            if ":" in stream_id:
+                parts = stream_id.split(":")
+                imdb_id = parts[0]
+                season = int(parts[1])
+                episode = int(parts[2])
+        except (IndexError, ValueError):
+            logger.warning(f"Malformed tt stream_id: {log_safe(stream_id)}")
+            imdb_id = stream_id.split(":")[0]
+            season = None
+            episode = None
+
         try:
             meta = await get_metadata_from_cinemeta(type, imdb_id)
             movie_name = meta.get("name")
@@ -1451,6 +1510,9 @@ async def subtitles_handler(
                     chat_id_val = int(chat_id)
                 except ValueError:
                     chat_id_val = chat_id
+
+                assert_chat_allowed(chat_id_val)
+
                 msg = await tg_client_manager.get_message(int(msg_id), chat_id=chat_id_val)
                 media = msg.video or msg.document or msg.audio
                 video_filename = getattr(media, "file_name", "") or ""
@@ -1463,12 +1525,18 @@ async def subtitles_handler(
         imdb_id = id
         season = None
         episode = None
-        if ":" in id:
-            parts = id.split(":")
-            imdb_id = parts[0]
-            season = int(parts[1])
-            episode = int(parts[2])
-            
+        try:
+            if ":" in id:
+                parts = id.split(":")
+                imdb_id = parts[0]
+                season = int(parts[1])
+                episode = int(parts[2])
+        except (IndexError, ValueError):
+            logger.warning(f"Malformed tt subtitles id: {log_safe(id)}")
+            imdb_id = id.split(":")[0]
+            season = None
+            episode = None
+
         try:
             video_filename = None
             if extra:
@@ -1480,7 +1548,7 @@ async def subtitles_handler(
                     video_filename = params["filename"][0]
 
             if video_filename:
-                logger.info(f"Resolving subtitles directly for filename: '{video_filename}'")
+                logger.info(f"Resolving subtitles directly for filename: '{log_safe(video_filename)}'")
                 subtitles = await find_subtitles_for_video(video_filename, api_key=api_key)
             else:
                 meta = await get_metadata_from_cinemeta(type, imdb_id)
@@ -1553,7 +1621,7 @@ async def tg_subtitle_proxy(
         )
         
     try:
-        logger.info(f"Downloading subtitle file from Telegram: {filename} (msg ID {message_id})")
+        logger.info(f"Downloading subtitle file from Telegram: {log_safe(filename)} (msg ID {message_id})")
         file_buffer = await tg_client_manager.client.download_media(msg, in_memory=True)
         content = file_buffer.getvalue()
     except Exception as e:
@@ -1614,19 +1682,7 @@ async def tg_stream_proxy(
         )
     
     range_header = request.headers.get("Range")
-    start = 0
-    end = file_size - 1
-    
-    if range_header:
-        try:
-            bytes_range = range_header.replace("bytes=", "").split("-")
-            if bytes_range[0]:
-                start = int(bytes_range[0])
-            if len(bytes_range) > 1 and bytes_range[1]:
-                end = int(bytes_range[1])
-        except ValueError:
-            pass
-            
+    start, end, status_code = parse_range_header(range_header, file_size)
     content_length = end - start + 1
     
     chunk_size = 1024 * 1024
@@ -1644,13 +1700,11 @@ async def tg_stream_proxy(
     }
     
     # Content-Range must only be sent on 206
-    status_code = 200
-    if range_header:
-        status_code = 206
+    if status_code == 206:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     
     if request.method == "HEAD":
-        logger.info(f"HEAD request for media '{filename}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
+        logger.info(f"HEAD request for media '{log_safe(filename)}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
         return Response(
             status_code=status_code,
             media_type=mime_type,
@@ -1709,7 +1763,7 @@ async def tg_stream_proxy(
                     logger.error(f"Streaming error on message {message_id}: {e}")
                     break
             
-    logger.info(f"Streaming media '{filename}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
+    logger.info(f"Streaming media '{log_safe(filename)}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
     
     return StreamingResponse(
         file_generator(),
@@ -1729,7 +1783,7 @@ async def tg_split_stream_proxy(
     require_api_key(api_key)
     assert_chat_allowed(chat_id)
         
-    msg_id_list = [int(x) for x in message_ids.split(",") if x.strip().isdigit()]
+    msg_id_list = parse_message_ids(message_ids)
     if not msg_id_list:
         raise HTTPException(status_code=400, detail="Invalid message IDs")
         
@@ -1775,19 +1829,7 @@ async def tg_split_stream_proxy(
             raise HTTPException(status_code=500, detail="Failed resolving split file metadata")
             
     range_header = request.headers.get("Range")
-    start = 0
-    end = total_size - 1
-    
-    if range_header:
-        try:
-            bytes_range = range_header.replace("bytes=", "").split("-")
-            if bytes_range[0]:
-                start = int(bytes_range[0])
-            if len(bytes_range) > 1 and bytes_range[1]:
-                end = int(bytes_range[1])
-        except ValueError:
-            pass
-            
+    start, end, status_code = parse_range_header(range_header, total_size)
     content_length = end - start + 1
     mime_type = chunks_info[0]["media"].mime_type or "video/mp4"
     
@@ -1800,9 +1842,7 @@ async def tg_split_stream_proxy(
         "X-Accel-Buffering": "no",
     }
     
-    status_code = 200
-    if range_header:
-        status_code = 206
+    if status_code == 206:
         headers["Content-Range"] = f"bytes {start}-{end}/{total_size}"
     
     if request.method == "HEAD":
@@ -1861,7 +1901,7 @@ async def tg_split_stream_proxy(
             if bytes_sent >= content_length:
                 break
                 
-    logger.info(f"Streaming split media '{filename}' (bytes {start}-{end}/{total_size}) - Status {status_code}")
+    logger.info(f"Streaming split media '{log_safe(filename)}' (bytes {start}-{end}/{total_size}) - Status {status_code}")
     
     return StreamingResponse(
         split_file_generator(),
@@ -1881,7 +1921,7 @@ async def tg_zip_stream_proxy(
     require_api_key(api_key)
     assert_chat_allowed(chat_id)
         
-    msg_id_list = [int(x) for x in message_ids.split(",") if x.strip().isdigit()]
+    msg_id_list = parse_message_ids(message_ids)
     if not msg_id_list:
         raise HTTPException(status_code=400, detail="Invalid message IDs")
         
@@ -1929,19 +1969,7 @@ async def tg_zip_stream_proxy(
         mime_type = "video/x-msvideo"
         
     range_header = request.headers.get("Range")
-    start = 0
-    end = file_size - 1
-    
-    if range_header:
-        try:
-            bytes_range = range_header.replace("bytes=", "").split("-")
-            if bytes_range[0]:
-                start = int(bytes_range[0])
-            if len(bytes_range) > 1 and bytes_range[1]:
-                end = int(bytes_range[1])
-        except ValueError:
-            pass
-            
+    start, end, status_code = parse_range_header(range_header, file_size)
     content_length = end - start + 1
     
     headers = {
@@ -1953,9 +1981,7 @@ async def tg_zip_stream_proxy(
         "X-Accel-Buffering": "no",
     }
     
-    status_code = 200
-    if range_header:
-        status_code = 206
+    if status_code == 206:
         headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     
     if request.method == "HEAD":
@@ -1967,7 +1993,7 @@ async def tg_zip_stream_proxy(
         
     import zipfile
     if target_entry.compress_type == zipfile.ZIP_STORED:
-        logger.info(f"ZIP entry '{filename}' is STORED (uncompressed). Using direct offset proxy.")
+        logger.info(f"ZIP entry '{log_safe(filename)}' is STORED (uncompressed). Using direct offset proxy.")
         reader = TelegramSeekableReader(tg_client_manager.client, messages)
         data_start = await get_zip_entry_data_offset(reader, target_entry.header_offset)
         
@@ -2037,7 +2063,7 @@ async def tg_zip_stream_proxy(
                 if bytes_sent >= stream_len:
                     break
                     
-        logger.info(f"Streaming uncompressed ZIP entry '{filename}' (raw bytes {stream_start}-{stream_end}/{total_size}) - Status {status_code}")
+        logger.info(f"Streaming uncompressed ZIP entry '{log_safe(filename)}' (raw bytes {stream_start}-{stream_end}/{total_size}) - Status {status_code}")
         return StreamingResponse(
             split_file_generator(),
             status_code=status_code,
@@ -2045,7 +2071,7 @@ async def tg_zip_stream_proxy(
             headers=headers
         )
     else:
-        logger.info(f"ZIP entry '{filename}' is COMPRESSED (type {target_entry.compress_type}). Streaming on-the-fly decompression.")
+        logger.info(f"ZIP entry '{log_safe(filename)}' is COMPRESSED (type {target_entry.compress_type}). Streaming on-the-fly decompression.")
         reader = TelegramSeekableReader(tg_client_manager.client, messages)
         return StreamingResponse(
             zip_compressed_generator(reader, filename, start, end),

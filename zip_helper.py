@@ -10,15 +10,16 @@ except RuntimeError:
 import zipfile
 import logging
 import anyio
+from collections import OrderedDict
 from typing import List, Union
 from pyrogram.types import Message
 
 logger = logging.getLogger("zip_helper")
 
-VIDEO_EXTENSIONS = ('.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.ts', '.m4v')
-
-def is_video_file(filename: str) -> bool:
-    return filename.lower().endswith(VIDEO_EXTENSIONS)
+# Cap how many 1MB blocks a single reader keeps in memory. Without a cap,
+# streaming a large ZIP entry (which reads sequentially) would accumulate the
+# entire decompressed file's worth of blocks in RAM for the request's lifetime.
+MAX_CACHED_BLOCKS = 16
 
 class TelegramSeekableReader:
     def __init__(self, client, messages: Union[Message, List[Message]], block_size=1024*1024):
@@ -42,11 +43,12 @@ class TelegramSeekableReader:
             self.total_size += media.file_size
             
         self.pos = 0
-        self.block_cache = {}
+        self.block_cache = OrderedDict()
 
     async def fetch_block(self, part_index: int, block_index: int) -> bytes:
         cache_key = (part_index, block_index)
         if cache_key in self.block_cache:
+            self.block_cache.move_to_end(cache_key)
             return self.block_cache[cache_key]
             
         part = self.parts[part_index]
@@ -62,6 +64,9 @@ class TelegramSeekableReader:
             logger.error(f"Error fetching block {block_index} for part {part_index}: {e}")
             
         self.block_cache[cache_key] = block
+        self.block_cache.move_to_end(cache_key)
+        while len(self.block_cache) > MAX_CACHED_BLOCKS:
+            self.block_cache.popitem(last=False)
         return block
 
     async def read_range(self, start: int, end: int) -> bytes:
