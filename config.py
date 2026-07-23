@@ -99,3 +99,11 @@ class Config:
                 "Point a domain at this server and terminate TLS with Caddy/Traefik.",
                 host,
             )
+
+        if not cls.API_KEY and host and host not in local_hosts:
+            logger.warning(
+                "API_KEY is not set and this addon is reachable on a public host (%s). "
+                "Anyone with the manifest URL can stream from your Telegram channels "
+                "and consume your bandwidth. Set API_KEY to require a shared secret.",
+                host,
+            )
