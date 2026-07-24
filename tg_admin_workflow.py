@@ -590,7 +590,7 @@ class AdminWorkflowManager:
 
         title_line = payload.get("official_title") or declared_title
         if tags:
-            title_line = " ".join(f"[{t}]" for t in tags) + f"\n{title_line}"
+            title_line = f"{title_line}\n" + " ".join(f"[{t}]" for t in tags)
         summary_lines = [f"✅ נשמר בהצלחה:\n*{title_line}*"]
         if payload.get("imdb_id"):
             summary_lines.append(f"IMDb: `{payload['imdb_id']}`")
