@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from urllib.parse import urlparse
 
@@ -28,6 +29,21 @@ class Config:
     # Optional direct TLS for uvicorn (prefer a reverse proxy like Caddy/Traefik in production)
     SSL_CERTFILE = os.getenv("SSL_CERTFILE", "")
     SSL_KEYFILE = os.getenv("SSL_KEYFILE", "")
+
+    # Optional Hebrew metadata-approval workflow (private Telegram group).
+    # This feature is fully optional: if any of these are missing, the addon
+    # runs exactly as before (filename/Cinemeta fallback only).
+    ADMIN_BOT_TOKEN = os.getenv("ADMIN_BOT_TOKEN", "")
+    MANAGEMENT_GROUP_ID = os.getenv("MANAGEMENT_GROUP_ID", "")
+
+    TMDB_BEARER_TOKEN = os.getenv("TMDB_BEARER_TOKEN", "")
+
+    # Normalize away an accidentally-included /rest/v1 suffix (a common copy
+    # -paste mistake from the Supabase dashboard) since metadata_store.py
+    # appends /rest/v1 itself.
+    _raw_supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    SUPABASE_URL = re.sub(r"/rest/v1$", "", _raw_supabase_url)
+    SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
     @classmethod
     def validate(cls):
@@ -68,7 +84,56 @@ class Config:
                 except ValueError:
                     pass
 
+        if cls.MANAGEMENT_GROUP_ID and isinstance(cls.MANAGEMENT_GROUP_ID, str):
+            val = cls.MANAGEMENT_GROUP_ID.strip()
+            if val.startswith("-") or val.isdigit():
+                try:
+                    cls.MANAGEMENT_GROUP_ID = int(val)
+                except ValueError:
+                    pass
+
         cls.warn_tls_misconfig()
+        cls.warn_admin_workflow_misconfig()
+
+    @classmethod
+    def admin_workflow_enabled(cls) -> bool:
+        """The Hebrew group approval workflow needs its own bot, group, and
+        Supabase to persist approved mappings. TMDb is optional (degrades to
+        manual tt / declared-name only)."""
+        return bool(cls.ADMIN_BOT_TOKEN and cls.MANAGEMENT_GROUP_ID and cls.metadata_store_enabled())
+
+    @classmethod
+    def metadata_store_enabled(cls) -> bool:
+        """Supabase-backed mapping lookup/storage."""
+        return bool(cls.SUPABASE_URL and cls.SUPABASE_SERVICE_ROLE_KEY)
+
+    @classmethod
+    def tmdb_enabled(cls) -> bool:
+        return bool(cls.TMDB_BEARER_TOKEN)
+
+    @classmethod
+    def warn_admin_workflow_misconfig(cls):
+        have_bot = bool(cls.ADMIN_BOT_TOKEN)
+        have_group = bool(cls.MANAGEMENT_GROUP_ID)
+        have_supabase = cls.metadata_store_enabled()
+
+        if have_bot != have_group:
+            logger.warning(
+                "ADMIN_BOT_TOKEN and MANAGEMENT_GROUP_ID must both be set to enable "
+                "the Hebrew metadata workflow; only one is configured, so it stays disabled."
+            )
+        elif have_bot and have_group and not have_supabase:
+            logger.warning(
+                "ADMIN_BOT_TOKEN/MANAGEMENT_GROUP_ID are set but SUPABASE_URL/"
+                "SUPABASE_SERVICE_ROLE_KEY are missing. The Hebrew workflow needs "
+                "Supabase to persist approved mappings; it stays disabled until both are set."
+            )
+        elif have_bot and have_group and have_supabase and not cls.tmdb_enabled():
+            logger.warning(
+                "TMDB_BEARER_TOKEN is not set. The Hebrew workflow will still run, "
+                "but title search will skip TMDb and only accept a manually entered "
+                "IMDb tt id or the declared name."
+            )
 
     @classmethod
     def warn_tls_misconfig(cls):

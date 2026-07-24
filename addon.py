@@ -18,6 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import Config
 from tg_client import tg_client_manager
+from tg_admin_workflow import admin_workflow_manager
+import metadata_store as store
 from utils import (
     format_size,
     matches_episode,
@@ -67,9 +69,20 @@ async def lifespan(app: FastAPI):
                 Config.warn_tls_misconfig()
             except Exception:
                 pass
+
+        # Optional Hebrew group workflow (separate bot client). Failure here
+        # must never take down Stremio streaming.
+        try:
+            await admin_workflow_manager.start()
+        except Exception as e:
+            logger.error(f"Admin workflow bot failed to start: {e}")
         yield
     finally:
         await tg_client_manager.stop()
+        try:
+            await admin_workflow_manager.stop()
+        except Exception as e:
+            logger.warning(f"Error stopping admin workflow bot: {e}")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -122,9 +135,19 @@ def content_disposition_inline(filename: str) -> str:
     return f"inline; filename=\"{safe}\"; filename*=UTF-8''{encoded}"
 
 
+def provider_label(resolution: str = None) -> str:
+    """Consistent Stremio provider/name label for every Telegram-backed stream."""
+    if resolution and resolution != "Unknown":
+        return f"Telegram_bot [{resolution}]"
+    return "Telegram_bot"
+
+
 def assert_chat_allowed(chat_id) -> None:
-    """Prevent IDOR: only configured Telegram channels may be streamed."""
+    """Prevent IDOR: only configured Telegram channels (or the Hebrew-workflow
+    management group, if configured) may be streamed."""
     allowed = tg_client_manager.get_channel_ids()
+    if Config.MANAGEMENT_GROUP_ID:
+        allowed = list(allowed) + [Config.MANAGEMENT_GROUP_ID]
     if not allowed:
         raise HTTPException(status_code=403, detail="No channels configured")
 
@@ -247,16 +270,23 @@ def verify_api_key(request: Request):
     require_api_key(api_key)
 
 def get_manifest(api_key: str = ""):
+    catalogs = []
+    if store.is_configured():
+        catalogs.append({
+            "type": "movie",
+            "id": "personal_telegram",
+            "name": "Personal Telegram",
+        })
     return {
         "id": "community.telegram.stremio.addon",
-        "version": "1.0.1",
+        "version": "1.1.0",
         "name": "Telegram Addon by SunilRoy-dev",
         "description": "Personal Telegram streaming proxy. For educational & personal testing only. Do not use for unauthorized hosting of copyrighted media.",
         "logo": "https://upload.wikimedia.org/wikipedia/commons/8/82/Telegram_logo.svg",
-        "resources": ["meta", "stream", "subtitles"],
+        "resources": ["catalog", "meta", "stream", "subtitles"],
         "types": ["movie", "series"],
-        "idPrefixes": ["tgfile_", "tt"],
-        "catalogs": [],
+        "idPrefixes": ["tgfile_", "tt", "personal_"],
+        "catalogs": catalogs,
         "behaviorHints": {
             "configurable": False,
             "configurationRequired": False
@@ -888,6 +918,9 @@ async def catalog_handler(
     extra: str = None,
     api_key: str = ""
 ):
+    if catalog_id == "personal_telegram":
+        return await _personal_catalog()
+
     if type not in ["movie", "series"]:
         return {"metas": []}
         
@@ -984,6 +1017,46 @@ async def catalog_handler(
 from fastapi.responses import FileResponse
 import os
 
+
+async def _personal_catalog() -> dict:
+    """List all approved personal mappings as a Stremio catalog."""
+    if not store.is_configured():
+        return {"metas": []}
+    try:
+        mappings = await store.list_personal_mappings(limit=200)
+    except Exception as e:
+        logger.error(f"Failed to list personal catalog: {e}")
+        return {"metas": []}
+
+    logo_url = f"{Config.ADDON_URL}/stremio_telegram_logo.png" if getattr(Config, "ADDON_URL", None) else None
+    metas = []
+    for m in mappings:
+        title = m.get("declared_title") or m.get("file_name") or "Personal video"
+        tags = m.get("tags") or []
+        description = f"📁 {m.get('file_name', '')}"
+        if tags:
+            description += f"\n🏷️ {', '.join(tags)}"
+        metas.append({
+            "id": f"personal_{m['id']}",
+            "type": "movie",
+            "name": title,
+            "description": description,
+            "poster": logo_url,
+        })
+    return {"metas": metas}
+
+
+async def _personal_stream_and_meta(mapping_id: str) -> dict:
+    if not store.is_configured():
+        return None
+    try:
+        mapping = await store.get_personal_mapping(mapping_id)
+    except Exception as e:
+        logger.error(f"Failed to load personal mapping {mapping_id}: {e}")
+        return None
+    return mapping
+
+
 @app.get("/stremio_telegram_logo.png")
 async def get_logo():
     if os.path.exists("stremio_telegram_logo.png"):
@@ -999,6 +1072,25 @@ async def get_banner():
 @app.get("/meta/{type}/{meta_id}.json", dependencies=[Depends(verify_api_key)])
 @app.get("/{api_key}/meta/{type}/{meta_id}.json", dependencies=[Depends(verify_api_key)])
 async def meta_handler(type: str, meta_id: str, api_key: str = ""):
+    if meta_id.startswith("personal_"):
+        mapping = await _personal_stream_and_meta(meta_id[len("personal_"):])
+        if not mapping:
+            return {"meta": {}}
+        title = mapping.get("declared_title") or mapping.get("file_name") or "Personal video"
+        tags = mapping.get("tags") or []
+        description = f"📁 {mapping.get('file_name', '')}"
+        if tags:
+            description += f"\n🏷️ {', '.join(tags)}"
+        return {
+            "meta": {
+                "id": meta_id,
+                "type": "movie",
+                "name": title,
+                "description": description,
+                "poster": f"{Config.ADDON_URL}/stremio_telegram_logo.png" if getattr(Config, "ADDON_URL", None) else None,
+            }
+        }
+
     if not meta_id.startswith("tgfile_"):
         return {"meta": {}}
         
@@ -1144,6 +1236,50 @@ async def find_subtitles_for_video(video_filename: str, api_key: str = "", cache
                 
     return subtitles
 
+
+async def build_stream_from_mapping(mapping: dict, api_key: str = "") -> dict:
+    """Build a Stremio stream item directly from an approved Supabase mapping,
+    skipping Cinemeta lookup and fuzzy Telegram search entirely."""
+    chat_id = mapping.get("source_chat_id")
+    message_ids = mapping.get("message_ids") or []
+    zip_entry = mapping.get("zip_entry")
+    file_name = mapping.get("file_name") or "video.mp4"
+    title = mapping.get("official_title") or mapping.get("declared_title") or file_name
+    resolution = mapping.get("resolution")
+
+    if not message_ids:
+        return None
+
+    try:
+        assert_chat_allowed(chat_id)
+    except HTTPException:
+        logger.warning(f"Supabase mapping references disallowed chat_id={chat_id}; ignoring")
+        return None
+
+    query_param = f"?api_key={api_key}" if api_key else ""
+    msg_ids_csv = ",".join(str(m) for m in message_ids)
+
+    if zip_entry:
+        stream_url = f"{Config.ADDON_URL}/stream/zip/{chat_id}/{msg_ids_csv}/{urllib.parse.quote(zip_entry)}{query_param}"
+    elif len(message_ids) > 1:
+        stream_url = f"{Config.ADDON_URL}/stream/split/{chat_id}/{msg_ids_csv}/{urllib.parse.quote(file_name)}{query_param}"
+    else:
+        stream_url = f"{Config.ADDON_URL}/stream/file/{chat_id}/{message_ids[0]}/{urllib.parse.quote(file_name)}{query_param}"
+
+    try:
+        subtitles = await find_subtitles_for_video(zip_entry or file_name, api_key=api_key)
+    except Exception:
+        subtitles = []
+
+    return {
+        "name": provider_label(resolution),
+        "title": title,
+        "url": stream_url,
+        "subtitles": subtitles,
+        "behaviorHints": {"notWebReady": True},
+    }
+
+
 @app.get("/stream/{type}/{stream_id}.json")
 @app.get("/{api_key}/stream/{type}/{stream_id}.json")
 async def stream_handler(
@@ -1157,6 +1293,15 @@ async def stream_handler(
         
     streams = []
     query_param = f"?api_key={api_key}" if api_key else ""
+
+    if stream_id.startswith("personal_"):
+        mapping_id = stream_id[len("personal_"):]
+        mapping = await _personal_stream_and_meta(mapping_id)
+        if mapping:
+            stream = await build_stream_from_mapping(mapping, api_key=api_key)
+            if stream:
+                streams.append(stream)
+        return {"streams": streams}
 
     if stream_id.startswith("tgfile_"):
         if "//" in stream_id:
@@ -1189,9 +1334,10 @@ async def stream_handler(
                             
                     stream_url = f"{Config.ADDON_URL}/stream/zip/{chat_id}/{msg_ids}/{urllib.parse.quote(zip_entry_filename)}{query_param}"
                     subtitles = await find_subtitles_for_video(zip_entry_filename, api_key=api_key)
+                    zip_resolution = parse_video_resolution(zip_entry_filename)
                     
                     streams.append({
-                        "name": "▶ TG ZIP Play",
+                        "name": provider_label(zip_resolution),
                         "title": f"{zip_entry_filename}\n💾 Stream ZIP entry | 📦 {format_size(file_size)}",
                         "url": stream_url,
                         "subtitles": subtitles,
@@ -1233,9 +1379,10 @@ async def stream_handler(
                                 total_size += med.file_size
                                 
                     stream_url = f"{Config.ADDON_URL}/stream/split/{chat_id}/{msg_ids}/{urllib.parse.quote(base_name)}{query_param}"
+                    split_resolution = parse_video_resolution(base_name)
                     
                     streams.append({
-                        "name": "▶ TG Play (Split)",
+                        "name": provider_label(split_resolution),
                         "title": f"{base_name}\n💾 Stitch stream | 📦 {format_size(total_size)}",
                         "url": stream_url,
                         "behaviorHints": {
@@ -1264,9 +1411,10 @@ async def stream_handler(
                     
                     stream_url = f"{Config.ADDON_URL}/stream/file/{chat_id}/{msg_id}/{urllib.parse.quote(file_name)}{query_param}"
                     subtitles = await find_subtitles_for_video(file_name, api_key=api_key)
+                    direct_resolution = parse_video_resolution(file_name)
                     
                     streams.append({
-                        "name": "▶ TG Play",
+                        "name": provider_label(direct_resolution),
                         "title": f"{file_name}\n💾 Direct stream | 📦 {format_size(file_size)}",
                         "url": stream_url,
                         "subtitles": subtitles,
@@ -1293,6 +1441,18 @@ async def stream_handler(
             imdb_id = stream_id.split(":")[0]
             season = None
             episode = None
+
+        # Exact approved mapping first (skips Cinemeta + fuzzy Telegram search).
+        if store.is_configured():
+            try:
+                mapping = await store.get_mapping_by_imdb(imdb_id, type, season, episode)
+            except Exception as e:
+                logger.error(f"Supabase mapping lookup failed for {imdb_id}: {e}")
+                mapping = None
+            if mapping:
+                stream = await build_stream_from_mapping(mapping, api_key=api_key)
+                if stream:
+                    return {"streams": [stream]}
 
         try:
             meta = await get_metadata_from_cinemeta(type, imdb_id)
@@ -1378,7 +1538,7 @@ async def stream_handler(
                                         stream_url = f"{Config.ADDON_URL}/stream/zip/{chat_id}/{msg_ids}/{urllib.parse.quote(entry.filename)}{query_param}"
                                         subtitles = await find_subtitles_for_video(entry.filename, api_key=api_key, cached_messages=tg_results_flat)
                                         valid_streams.append({
-                                            "name": f"▶ TG ZIP Play [{entry_res}]",
+                                            "name": provider_label(entry_res),
                                             "title": f"{entry.filename}\n💾 Stream ZIP entry | 📦 {format_size(entry.file_size)}",
                                             "url": stream_url,
                                             "subtitles": subtitles,
@@ -1394,7 +1554,7 @@ async def stream_handler(
                                 continue
                             stream_url = f"{Config.ADDON_URL}/stream/split/{chat_id}/{msg_ids}/{urllib.parse.quote(base_name)}{query_param}"
                             valid_streams.append({
-                                "name": f"▶ TG Play (Split) [{resolution}]",
+                                "name": provider_label(resolution),
                                 "title": f"{base_name}\n💾 Stitch stream | 📦 {format_size(total_size)}",
                                 "url": stream_url,
                                 "behaviorHints": {"notWebReady": True},
@@ -1445,7 +1605,7 @@ async def stream_handler(
                                         stream_url = f"{Config.ADDON_URL}/stream/zip/{chat_id}/{msg.id}/{urllib.parse.quote(entry.filename)}{query_param}"
                                         subtitles = await find_subtitles_for_video(entry.filename, api_key=api_key, cached_messages=tg_results_flat)
                                         valid_streams.append({
-                                            "name": f"▶ TG ZIP Play [{entry_res}]",
+                                            "name": provider_label(entry_res),
                                             "title": f"{entry.filename}\n💾 Stream ZIP entry | 📦 {format_size(entry.file_size)}",
                                             "url": stream_url,
                                             "subtitles": subtitles,
@@ -1463,7 +1623,7 @@ async def stream_handler(
                             subtitles = await find_subtitles_for_video(file_name, api_key=api_key, cached_messages=tg_results_flat)
                             
                             valid_streams.append({
-                                "name": f"▶ TG Play [{resolution}]",
+                                "name": provider_label(resolution),
                                 "title": f"{file_name}\n💾 Telegram File | 📦 {format_size(file_size)}",
                                 "url": stream_url,
                                 "subtitles": subtitles,
