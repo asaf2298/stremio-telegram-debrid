@@ -124,8 +124,11 @@ async def search(query: str, media_type: str = None, language: str = "he-IL", li
                 overview=item.get("overview") or "",
             )
         )
-        if len(candidates) >= limit:
-            break
+
+    # When several titles match, prefer the later release (newer year).
+    # Entries without a year sort last.
+    candidates.sort(key=lambda c: (c.year is not None, c.year or 0), reverse=True)
+    candidates = candidates[:limit]
 
     _search_cache.set(cache_key, candidates)
     return candidates

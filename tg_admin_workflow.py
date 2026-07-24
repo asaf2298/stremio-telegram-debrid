@@ -518,6 +518,8 @@ class AdminWorkflowManager:
             return
 
         title_line = payload.get("official_title") or declared_title
+        if tags:
+            title_line = " ".join(f"[{t}]" for t in tags) + f" {title_line}"
         summary_lines = [f"✅ נשמר בהצלחה: *{title_line}*"]
         if payload.get("imdb_id"):
             summary_lines.append(f"IMDb: `{payload['imdb_id']}`")
@@ -526,13 +528,17 @@ class AdminWorkflowManager:
         if classification == "personal":
             summary_lines.append("קטגוריה: Personal Telegram")
 
-        await self.bot.send_message(
-            chat_id,
-            "\n".join(summary_lines),
-            reply_markup=_kb(
-                [[("✏️ ערוך תגים", _cb(workflow["id"], "edit_tags")), ("🔄 קטגוריה חדשה", _cb(workflow["id"], "reclassify"))]]
-            ),
-        )
+        # Post-save edit buttons temporarily hidden: the workflow is marked
+        # "done" before this message is sent, so callbacks were rejected as
+        # expired ("השאלה הזו לא בתוקף יותר"). Handlers for edit_tags /
+        # reclassify remain below for a later fix that reopens the workflow.
+        # reply_markup=_kb(
+        #     [[
+        #         ("✏️ ערוך תגים", _cb(workflow["id"], "edit_tags")),
+        #         ("🔄 קטגוריה חדשה", _cb(workflow["id"], "reclassify")),
+        #     ]]
+        # )
+        await self.bot.send_message(chat_id, "\n".join(summary_lines))
 
 
 admin_workflow_manager = AdminWorkflowManager()

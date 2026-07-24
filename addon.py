@@ -128,11 +128,18 @@ def log_safe(value: str, max_len: int = 200) -> str:
 
 
 def content_disposition_inline(filename: str) -> str:
-    """Build a safe Content-Disposition value (prevents header injection)."""
+    """Build a safe Content-Disposition value (prevents header injection).
+
+    HTTP header values must be Latin-1. Put Unicode only in the RFC 5987
+    ``filename*`` parameter; keep ``filename=`` as an ASCII fallback so
+    Hebrew (and other non-ASCII) names do not 500 the stream endpoint.
+    """
     safe = re.sub(r'[\r\n"\\\\]', "_", filename or "file")
     safe = safe[:200] or "file"
-    encoded = urllib.parse.quote(safe)
-    return f"inline; filename=\"{safe}\"; filename*=UTF-8''{encoded}"
+    encoded = urllib.parse.quote(safe, safe="")
+    ascii_fallback = re.sub(r"[^\x20-\x7E]", "_", safe) or "file"
+    ascii_fallback = ascii_fallback.replace(";", "_")
+    return f"inline; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
 
 
 def provider_label(resolution: str = None) -> str:
@@ -140,6 +147,25 @@ def provider_label(resolution: str = None) -> str:
     if resolution and resolution != "Unknown":
         return f"Telegram_bot [{resolution}]"
     return "Telegram_bot"
+
+
+def format_mapping_title(mapping: dict, *, fallback: str = "video") -> str:
+    """Title shown in Stremio, with approved chat tags as prefixes.
+
+    Example: tags=["דיבוב עברית", "1080p"] + official "המלך האריה"
+    -> "[דיבוב עברית] [1080p] המלך האריה"
+    """
+    base = (
+        mapping.get("official_title")
+        or mapping.get("declared_title")
+        or mapping.get("file_name")
+        or fallback
+    )
+    tags = [str(t).strip() for t in (mapping.get("tags") or []) if str(t).strip()]
+    if not tags:
+        return base
+    prefix = " ".join(f"[{t}]" for t in tags)
+    return f"{prefix} {base}"
 
 
 def assert_chat_allowed(chat_id) -> None:
@@ -1031,11 +1057,8 @@ async def _personal_catalog() -> dict:
     logo_url = f"{Config.ADDON_URL}/stremio_telegram_logo.png" if getattr(Config, "ADDON_URL", None) else None
     metas = []
     for m in mappings:
-        title = m.get("declared_title") or m.get("file_name") or "Personal video"
-        tags = m.get("tags") or []
+        title = format_mapping_title(m, fallback="Personal video")
         description = f"📁 {m.get('file_name', '')}"
-        if tags:
-            description += f"\n🏷️ {', '.join(tags)}"
         metas.append({
             "id": f"personal_{m['id']}",
             "type": "movie",
@@ -1076,11 +1099,8 @@ async def meta_handler(type: str, meta_id: str, api_key: str = ""):
         mapping = await _personal_stream_and_meta(meta_id[len("personal_"):])
         if not mapping:
             return {"meta": {}}
-        title = mapping.get("declared_title") or mapping.get("file_name") or "Personal video"
-        tags = mapping.get("tags") or []
+        title = format_mapping_title(mapping, fallback="Personal video")
         description = f"📁 {mapping.get('file_name', '')}"
-        if tags:
-            description += f"\n🏷️ {', '.join(tags)}"
         return {
             "meta": {
                 "id": meta_id,
@@ -1244,7 +1264,7 @@ async def build_stream_from_mapping(mapping: dict, api_key: str = "") -> dict:
     message_ids = mapping.get("message_ids") or []
     zip_entry = mapping.get("zip_entry")
     file_name = mapping.get("file_name") or "video.mp4"
-    title = mapping.get("official_title") or mapping.get("declared_title") or file_name
+    title = format_mapping_title(mapping, fallback=file_name)
     resolution = mapping.get("resolution")
 
     if not message_ids:
