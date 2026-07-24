@@ -1,4 +1,5 @@
 import os
+import re
 import logging
 from urllib.parse import urlparse
 
@@ -37,7 +38,11 @@ class Config:
 
     TMDB_BEARER_TOKEN = os.getenv("TMDB_BEARER_TOKEN", "")
 
-    SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+    # Normalize away an accidentally-included /rest/v1 suffix (a common copy
+    # -paste mistake from the Supabase dashboard) since metadata_store.py
+    # appends /rest/v1 itself.
+    _raw_supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    SUPABASE_URL = re.sub(r"/rest/v1$", "", _raw_supabase_url)
     SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
     @classmethod
