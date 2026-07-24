@@ -150,10 +150,10 @@ def provider_label(resolution: str = None) -> str:
 
 
 def format_mapping_title(mapping: dict, *, fallback: str = "video") -> str:
-    """Title shown in Stremio, with approved chat tags as prefixes.
+    """Title shown in Stremio, with approved chat tags as a prefix line.
 
     Example: tags=["דיבוב עברית", "1080p"] + official "המלך האריה"
-    -> "[דיבוב עברית] [1080p] המלך האריה"
+    -> "[דיבוב עברית] [1080p]\\nהמלך האריה"
     """
     base = (
         mapping.get("official_title")
@@ -165,7 +165,7 @@ def format_mapping_title(mapping: dict, *, fallback: str = "video") -> str:
     if not tags:
         return base
     prefix = " ".join(f"[{t}]" for t in tags)
-    return f"{prefix} {base}"
+    return f"{prefix}\n{base}"
 
 
 def assert_chat_allowed(chat_id) -> None:

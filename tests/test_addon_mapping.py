@@ -19,7 +19,7 @@ def test_format_mapping_title_prefixes_tags():
     assert addon.format_mapping_title({
         "official_title": "המלך האריה",
         "tags": ["דיבוב עברית", "1080p"],
-    }) == "[דיבוב עברית] [1080p] המלך האריה"
+    }) == "[דיבוב עברית] [1080p]\nהמלך האריה"
 
 
 def test_format_mapping_title_without_tags():
@@ -73,7 +73,7 @@ async def test_build_stream_from_mapping_single_file_url():
         stream = await addon.build_stream_from_mapping(mapping)
 
     assert stream["name"] == "Telegram_bot [1080p]"
-    assert stream["title"] == "[דיבוב עברית] [1080p] Movie Official"
+    assert stream["title"] == "[דיבוב עברית] [1080p]\nMovie Official"
     assert "/stream/file/-1001111111111/42/" in stream["url"]
 
 
@@ -195,7 +195,7 @@ async def test_personal_catalog_lists_mappings():
 
     assert len(result["metas"]) == 1
     assert result["metas"][0]["id"] == "personal_abc-123"
-    assert result["metas"][0]["name"] == "[1080p] My Vacation"
+    assert result["metas"][0]["name"] == "[1080p]\nMy Vacation"
 
 
 @pytest.mark.asyncio
