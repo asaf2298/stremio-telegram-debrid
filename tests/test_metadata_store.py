@@ -113,6 +113,8 @@ async def test_get_mapping_by_imdb_null_season_episode_filters():
     assert result["id"] == "x"
     assert captured_params["season"] == "is.null"
     assert captured_params["episode"] == "is.null"
+    assert captured_params["order"] == "created_at.desc,updated_at.desc"
+    assert captured_params["limit"] == "1"
 
 
 @pytest.mark.asyncio

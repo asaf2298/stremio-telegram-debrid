@@ -153,7 +153,9 @@ async def get_mapping_by_imdb(
         "stremio_type": f"eq.{stremio_type}",
         "select": "*",
         "limit": "1",
-        "order": "updated_at.desc",
+        # Prefer the most recently approved/uploaded mapping when several
+        # rows share the same tt id (e.g. re-uploads or remasters).
+        "order": "created_at.desc,updated_at.desc",
     }
     if season is not None:
         params["season"] = f"eq.{season}"

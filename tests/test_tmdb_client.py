@@ -70,6 +70,47 @@ async def test_search_movie_hebrew_parses_candidates():
 
 
 @pytest.mark.asyncio
+async def test_search_prefers_later_release_year():
+    _enable_tmdb()
+
+    async def fake_get(url, params=None, headers=None):
+        return FakeResponse(
+            200,
+            {
+                "results": [
+                    {
+                        "id": 1,
+                        "title": "Dune",
+                        "original_title": "Dune",
+                        "release_date": "1984-12-14",
+                    },
+                    {
+                        "id": 2,
+                        "title": "חולית",
+                        "original_title": "Dune",
+                        "release_date": "2021-10-22",
+                    },
+                    {
+                        "id": 3,
+                        "title": "Dune No Year",
+                        "original_title": "Dune",
+                    },
+                ]
+            },
+        )
+
+    with patch("httpx.AsyncClient") as mock_client_cls:
+        mock_client = AsyncMock()
+        mock_client.get = AsyncMock(side_effect=fake_get)
+        mock_client_cls.return_value.__aenter__.return_value = mock_client
+
+        candidates = await tmdb_client.search("Dune", media_type="movie", limit=3)
+
+    assert [c.tmdb_id for c in candidates] == [2, 1, 3]
+    assert candidates[0].year == 2021
+
+
+@pytest.mark.asyncio
 async def test_search_tv_maps_to_series_stremio_type():
     _enable_tmdb()
 

@@ -15,6 +15,31 @@ def test_provider_label_without_resolution():
     assert addon.provider_label("Unknown") == "Telegram_bot"
 
 
+def test_format_mapping_title_prefixes_tags():
+    assert addon.format_mapping_title({
+        "official_title": "המלך האריה",
+        "tags": ["דיבוב עברית", "1080p"],
+    }) == "[דיבוב עברית] [1080p] המלך האריה"
+
+
+def test_format_mapping_title_without_tags():
+    assert addon.format_mapping_title({
+        "declared_title": "Only Title",
+        "tags": [],
+    }) == "Only Title"
+
+
+def test_content_disposition_inline_ascii_fallback_for_hebrew():
+    value = addon.content_disposition_inline("לולו_סרט.mkv")
+    value.encode("latin-1")  # must not raise — used as an HTTP header
+    assert "filename*=UTF-8''" in value
+    assert "%D7%9C" in value  # Hebrew percent-encoded in filename*
+    assert 'filename="' in value
+    # quoted filename= must stay ASCII
+    quoted = value.split('filename="', 1)[1].split('"', 1)[0]
+    quoted.encode("ascii")
+
+
 def test_assert_chat_allowed_accepts_configured_channel():
     addon.assert_chat_allowed(-1001111111111)  # from conftest TELEGRAM_CHANNEL_ID
 
@@ -42,12 +67,13 @@ async def test_build_stream_from_mapping_single_file_url():
         "official_title": "Movie Official",
         "declared_title": "Movie Declared",
         "resolution": "1080p",
+        "tags": ["דיבוב עברית", "1080p"],
     }
     with patch("addon.find_subtitles_for_video", new=AsyncMock(return_value=[])):
         stream = await addon.build_stream_from_mapping(mapping)
 
     assert stream["name"] == "Telegram_bot [1080p]"
-    assert stream["title"] == "Movie Official"
+    assert stream["title"] == "[דיבוב עברית] [1080p] Movie Official"
     assert "/stream/file/-1001111111111/42/" in stream["url"]
 
 
@@ -169,7 +195,7 @@ async def test_personal_catalog_lists_mappings():
 
     assert len(result["metas"]) == 1
     assert result["metas"][0]["id"] == "personal_abc-123"
-    assert result["metas"][0]["name"] == "My Vacation"
+    assert result["metas"][0]["name"] == "[1080p] My Vacation"
 
 
 @pytest.mark.asyncio
