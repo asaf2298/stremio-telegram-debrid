@@ -149,28 +149,34 @@ async def test_personal_flow_saves_mapping_with_classification_personal():
 
 
 # ---------------------------------------------------------------------------
-# Content flow: TMDb candidate approved
+# Content flow: TMDb candidate list + pick
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_content_flow_tmdb_approved_sets_imdb_and_official_title():
+async def test_content_flow_tmdb_lists_candidates_for_selection():
     _configure_enabled()
     mgr = _manager()
 
-    candidate = SimpleNamespace(
-        tmdb_id=872585,
-        media_type="movie",
-        title="אופנהיימר",
-        original_title="Oppenheimer",
-        year=2023,
-        to_dict=lambda: {
-            "tmdb_id": 872585,
-            "media_type": "movie",
-            "title": "אופנהיימר",
-            "original_title": "Oppenheimer",
-            "year": 2023,
-        },
-    )
+    def _cand(tmdb_id, title, year):
+        return SimpleNamespace(
+            tmdb_id=tmdb_id,
+            media_type="movie",
+            title=title,
+            original_title=title,
+            year=year,
+            to_dict=lambda i=tmdb_id, t=title, y=year: {
+                "tmdb_id": i,
+                "media_type": "movie",
+                "title": t,
+                "original_title": t,
+                "year": y,
+            },
+        )
+
+    candidates = [
+        _cand(2, "Dune", 2021),
+        _cand(1, "Dune", 1984),
+    ]
 
     workflow = {
         "id": "wf-2",
@@ -178,29 +184,68 @@ async def test_content_flow_tmdb_approved_sets_imdb_and_official_title():
         "status": "open",
         "payload": {
             "message_ids": [20],
-            "file_name": "Oppenheimer.2023.1080p.mkv",
+            "file_name": "Dune.mkv",
             "caption": "",
             "classification": "movie",
             "stremio_type": "movie",
-            "declared_title": "Oppenheimer",
+            "declared_title": "Dune",
         },
     }
 
     with patch("tg_admin_workflow.tmdb_client.is_configured", return_value=True), \
-         patch("tg_admin_workflow.tmdb_client.search", new=AsyncMock(return_value=[candidate])), \
-         patch("tg_admin_workflow.tmdb_client.resolve_candidate_imdb", new=AsyncMock(return_value="tt15398776")), \
+         patch("tg_admin_workflow.tmdb_client.search", new=AsyncMock(return_value=candidates)) as mock_search, \
          patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()):
         await mgr._search_and_confirm(Config.MANAGEMENT_GROUP_ID, workflow)
 
-    assert workflow["payload"]["tmdb_candidate"]["tmdb_id"] == 872585
-    assert workflow["payload"]["tmdb_candidate_imdb"] == "tt15398776"
+    mock_search.assert_awaited_once()
+    assert mock_search.await_args.kwargs["limit"] == 15
+    assert len(workflow["payload"]["tmdb_candidates"]) == 2
 
-    with patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()):
-        await mgr._apply_tmdb_candidate(Config.MANAGEMENT_GROUP_ID, workflow)
+    send_kwargs = mgr.bot.send_message.await_args.kwargs
+    markup = send_kwargs["reply_markup"]
+    # 2 candidate rows + 1 IMDb row
+    assert len(markup.inline_keyboard) == 3
+    assert markup.inline_keyboard[0][0].callback_data.endswith("|tp_0")
+    assert markup.inline_keyboard[1][0].callback_data.endswith("|tp_1")
+    assert "IMDb" in markup.inline_keyboard[2][0].text
+
+
+@pytest.mark.asyncio
+async def test_select_tmdb_candidate_resolves_imdb_and_continues():
+    _configure_enabled()
+    mgr = _manager()
+    workflow = {
+        "id": "wf-2b",
+        "chat_id": Config.MANAGEMENT_GROUP_ID,
+        "status": "open",
+        "payload": {
+            "message_ids": [20],
+            "file_name": "x.mkv",
+            "stremio_type": "movie",
+            "tmdb_candidates": [
+                {
+                    "tmdb_id": 872585,
+                    "media_type": "movie",
+                    "title": "אופנהיימר",
+                    "original_title": "Oppenheimer",
+                    "year": 2023,
+                }
+            ],
+        },
+    }
+
+    with patch(
+        "tg_admin_workflow.tmdb_client.get_external_ids",
+        new=AsyncMock(return_value={"imdb_id": "tt15398776"}),
+    ), \
+         patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()), \
+         patch.object(mgr, "_after_imdb_resolved", new=AsyncMock()) as mock_after:
+        await mgr._select_tmdb_candidate(Config.MANAGEMENT_GROUP_ID, workflow, 0)
 
     assert workflow["payload"]["imdb_id"] == "tt15398776"
     assert workflow["payload"]["official_title"] == "אופנהיימר"
     assert workflow["payload"]["tmdb_id"] == 872585
+    mock_after.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +269,7 @@ async def test_manual_tt_rejects_invalid_format():
         await mgr._on_text_reply(reply)
 
     reply.reply_text.assert_awaited_once()
-    assert "לא תקין" in reply.reply_text.call_args[0][0]
+    assert "לא מצאתי" in reply.reply_text.call_args[0][0]
     assert workflow["payload"].get("imdb_id") is None
 
 
@@ -253,6 +298,44 @@ async def test_manual_tt_accepts_valid_format_and_fetches_cinemeta_title():
     assert workflow["payload"]["imdb_id"] == "tt15398776"
     assert workflow["payload"]["official_title"] == "Oppenheimer"
     mock_after.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_manual_tt_extracts_id_from_imdb_url():
+    _configure_enabled()
+    mgr = _manager()
+    workflow = {
+        "id": "wf-4b",
+        "chat_id": Config.MANAGEMENT_GROUP_ID,
+        "status": "open",
+        "step": "ask_manual_tt",
+        "payload": {"message_ids": [1], "stremio_type": "movie", "file_name": "x.mkv"},
+    }
+    reply = _fake_message(
+        text="https://www.imdb.com/title/tt15398776/?ref_=fn_al_tt_1",
+        reply_to_message_id=902,
+    )
+
+    with patch("tg_admin_workflow.store.get_open_workflow_by_prompt", new=AsyncMock(return_value=workflow)), \
+         patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()), \
+         patch(
+             "tg_admin_workflow.get_metadata_from_cinemeta",
+             new=AsyncMock(return_value={"name": "Oppenheimer"}),
+         ), \
+         patch.object(mgr, "_after_imdb_resolved", new=AsyncMock()) as mock_after:
+        await mgr._on_text_reply(reply)
+
+    assert workflow["payload"]["imdb_id"] == "tt15398776"
+    mock_after.assert_awaited_once()
+
+
+def test_extract_imdb_id_from_various_inputs():
+    from tg_admin_workflow import extract_imdb_id
+
+    assert extract_imdb_id("tt7450390") == "tt7450390"
+    assert extract_imdb_id("https://www.imdb.com/title/tt7450390/") == "tt7450390"
+    assert extract_imdb_id("see TT1234567 please") == "tt1234567"
+    assert extract_imdb_id("no id here") is None
 
 
 # ---------------------------------------------------------------------------

@@ -34,9 +34,22 @@ from search_utils import parse_video_resolution
 
 logger = logging.getLogger("tg_admin_workflow")
 
-_IMDB_RE = re.compile(r"^tt\d{5,9}$", re.IGNORECASE)
+# Find tt##### anywhere in free text / IMDb URLs (not only exact full-string match).
+_IMDB_FIND_RE = re.compile(r"tt\d{5,9}", re.IGNORECASE)
 _SKIP_WORDS = {"דלג", "-", "skip", "none"}
 _CONFIRM_WORDS = {"אישור", "אשר", "ok", "כן"}
+
+# Hard cap for TMDb pick-list buttons (Telegram keyboards get unwieldy past this).
+_TMDB_CHOICE_LIMIT = 15
+_BUTTON_LABEL_MAX = 60
+
+
+def extract_imdb_id(text: str) -> str | None:
+    """Extract the first IMDb tt id from free text or a full IMDb URL."""
+    if not text:
+        return None
+    m = _IMDB_FIND_RE.search(text)
+    return m.group(0).lower() if m else None
 
 
 def _kb(rows: list) -> InlineKeyboardMarkup:
@@ -47,6 +60,15 @@ def _kb(rows: list) -> InlineKeyboardMarkup:
 
 def _cb(workflow_id: str, action: str) -> str:
     return f"{workflow_id}|{action}"
+
+
+def _candidate_button_label(candidate: dict) -> str:
+    title = candidate.get("title") or candidate.get("original_title") or "ללא שם"
+    year = candidate.get("year")
+    label = f"{title} ({year})" if year else str(title)
+    if len(label) > _BUTTON_LABEL_MAX:
+        return label[: _BUTTON_LABEL_MAX - 3] + "..."
+    return label
 
 
 class AdminWorkflowManager:
@@ -225,7 +247,15 @@ class AdminWorkflowManager:
             workflow["payload"] = payload
             await self._ask_title(chat_id, workflow)
         elif action == "tc_approve":
+            # Legacy single-candidate approve (kept for in-flight messages).
             await self._apply_tmdb_candidate(chat_id, workflow)
+        elif action.startswith("tp_"):
+            try:
+                idx = int(action[3:])
+            except ValueError:
+                logger.warning(f"Invalid TMDb pick action: {action}")
+                return
+            await self._select_tmdb_candidate(chat_id, workflow, idx)
         elif action == "tc_manual" or action == "mt_from_confirm":
             await self._ask_manual_tt(chat_id, workflow)
         elif action == "tc_name" or action == "un":
@@ -273,13 +303,13 @@ class AdminWorkflowManager:
             await self._search_and_confirm(chat_id, workflow)
 
         elif step == "ask_manual_tt":
-            candidate = text.strip()
-            if not _IMDB_RE.match(candidate):
+            imdb_id = extract_imdb_id(text)
+            if not imdb_id:
                 await message.reply_text(
-                    "מזהה לא תקין. שלח בפורמט tt1234567 (למשל tt15398776)."
+                    "לא מצאתי מזהה tt. שלח tt1234567 או קישור IMDb מלא "
+                    "(למשל https://www.imdb.com/title/tt15398776/)."
                 )
                 return
-            imdb_id = candidate.lower()
             payload["imdb_id"] = imdb_id
             try:
                 cine = await get_metadata_from_cinemeta(payload.get("stremio_type", "movie"), imdb_id)
@@ -391,47 +421,84 @@ class AdminWorkflowManager:
 
         candidates = []
         if tmdb_client.is_configured():
-            candidates = await tmdb_client.search(title, media_type=media_type)
+            candidates = await tmdb_client.search(
+                title, media_type=media_type, limit=_TMDB_CHOICE_LIMIT
+            )
 
         if not candidates:
             await self._ask_no_candidate(chat_id, workflow)
             return
 
-        top = candidates[0]
-        imdb_id = await tmdb_client.resolve_candidate_imdb(top)
-
-        payload["tmdb_candidate"] = top.to_dict()
-        payload["tmdb_candidate_imdb"] = imdb_id
+        payload["tmdb_candidates"] = [c.to_dict() for c in candidates]
+        # Clear legacy single-candidate fields from older flow versions.
+        payload.pop("tmdb_candidate", None)
+        payload.pop("tmdb_candidate_imdb", None)
         await store.update_workflow(workflow["id"], payload=payload)
         workflow["payload"] = payload
 
-        year_str = f" ({top.year})" if top.year else ""
-        imdb_line = f"IMDb: `{imdb_id}`" if imdb_id else "IMDb: לא נמצא"
+        rows = [
+            [(_candidate_button_label(d), _cb(workflow["id"], f"tp_{i}"))]
+            for i, d in enumerate(payload["tmdb_candidates"])
+        ]
+        rows.append(
+            [("🔢 להזין קישור / tt מ־IMDb", _cb(workflow["id"], "tc_manual"))]
+        )
+
         prompt = await self.bot.send_message(
             chat_id,
-            f"מצאתי:\n*{top.title}*{year_str}\n{top.original_title}\n{imdb_line}\n\nהאם זה נכון?",
-            reply_markup=_kb(
-                [
-                    [("✅ אישור", _cb(workflow["id"], "tc_approve"))],
-                    [("🔢 יש לי tt אחר", _cb(workflow["id"], "tc_manual")), ("➡️ המשך עם השם", _cb(workflow["id"], "tc_name"))],
-                ]
-            ),
+            f"נמצאו {len(candidates)} התאמות — בחר אחת:\n"
+            f"(או הזן קישור / מזהה IMDb אם אף אחת לא מתאימה)",
+            reply_markup=_kb(rows),
         )
         await store.update_workflow(workflow["id"], step="ask_tmdb_confirm", last_prompt_message_id=prompt.id)
 
     async def _ask_no_candidate(self, chat_id: int, workflow: dict):
         prompt = await self.bot.send_message(
             chat_id,
-            "לא נמצאה התאמה אוטומטית. יש לך מזהה IMDb (tt...)?",
+            "לא נמצאה התאמה אוטומטית. יש לך קישור או מזהה IMDb (tt...)?",
             reply_markup=_kb(
-                [[("🔢 יש לי tt", _cb(workflow["id"], "mt_from_confirm")), ("➡️ המשך עם השם", _cb(workflow["id"], "un"))]]
+                [[
+                    ("🔢 להזין קישור / tt מ־IMDb", _cb(workflow["id"], "mt_from_confirm")),
+                    ("➡️ המשך עם השם", _cb(workflow["id"], "un")),
+                ]]
             ),
         )
         await store.update_workflow(workflow["id"], step="ask_tmdb_confirm", last_prompt_message_id=prompt.id)
 
+    async def _select_tmdb_candidate(self, chat_id: int, workflow: dict, index: int):
+        payload = workflow.get("payload") or {}
+        candidates = payload.get("tmdb_candidates") or []
+        if index < 0 or index >= len(candidates):
+            await self.bot.send_message(chat_id, "הבחירה לא תקפה. נסה שוב מהרשימה.")
+            return
+
+        candidate = candidates[index]
+        imdb_id = None
+        try:
+            ids = await tmdb_client.get_external_ids(
+                candidate.get("tmdb_id"), candidate.get("media_type")
+            )
+            if ids:
+                imdb_id = ids.get("imdb_id")
+        except Exception as e:
+            logger.warning(f"Failed resolving IMDb for TMDb pick {index}: {e}")
+
+        payload["tmdb_candidate"] = candidate
+        payload["tmdb_candidate_imdb"] = imdb_id
+        payload["official_title"] = candidate.get("title")
+        payload["tmdb_id"] = candidate.get("tmdb_id")
+        payload["imdb_id"] = imdb_id
+        await store.update_workflow(workflow["id"], payload=payload)
+        workflow["payload"] = payload
+        await self._after_imdb_resolved(chat_id, workflow)
+
     async def _apply_tmdb_candidate(self, chat_id: int, workflow: dict):
         payload = workflow.get("payload") or {}
         candidate = payload.get("tmdb_candidate") or {}
+        if not candidate and payload.get("tmdb_candidates"):
+            # Legacy approve with only a list stored — take the first entry.
+            await self._select_tmdb_candidate(chat_id, workflow, 0)
+            return
         payload["official_title"] = candidate.get("title")
         payload["tmdb_id"] = candidate.get("tmdb_id")
         payload["imdb_id"] = payload.get("tmdb_candidate_imdb")
@@ -449,7 +516,11 @@ class AdminWorkflowManager:
         await self._after_imdb_resolved(chat_id, workflow)
 
     async def _ask_manual_tt(self, chat_id: int, workflow: dict):
-        prompt = await self.bot.send_message(chat_id, "שלח מזהה IMDb בפורמט tt1234567")
+        prompt = await self.bot.send_message(
+            chat_id,
+            "שלח קישור IMDb או מזהה tt "
+            "(למשל `tt15398776` או https://www.imdb.com/title/tt15398776/).",
+        )
         await store.update_workflow(workflow["id"], step="ask_manual_tt", last_prompt_message_id=prompt.id)
 
     async def _after_imdb_resolved(self, chat_id: int, workflow: dict):

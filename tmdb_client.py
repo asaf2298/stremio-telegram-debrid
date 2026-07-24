@@ -61,16 +61,18 @@ class TmdbCandidate:
         }
 
 
-async def search(query: str, media_type: str = None, language: str = "he-IL", limit: int = 5) -> list:
+async def search(query: str, media_type: str = None, language: str = "he-IL", limit: int = 15) -> list:
     """Search TMDb for a title, Hebrew-localized by default.
 
     media_type: None (multi search), "movie", or "tv".
-    Returns a list of TmdbCandidate, best match first, capped at `limit`.
+    Returns a list of TmdbCandidate, newer releases first, capped at `limit`
+    (default 15 for the Telegram pick-list).
     """
     if not is_configured() or not query or not query.strip():
         return []
 
-    cache_key = f"{media_type or 'multi'}:{language}:{query.strip().lower()}"
+    limit = max(1, min(int(limit or 15), 15))
+    cache_key = f"{media_type or 'multi'}:{language}:{limit}:{query.strip().lower()}"
     cached = _search_cache.get(cache_key)
     if cached is not None:
         return cached
