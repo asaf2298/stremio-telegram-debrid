@@ -277,25 +277,31 @@ class TelegramClientManager:
     def initialize(self):
         Config.validate()
         
+        # Pyrogram defaults max_concurrent_transmissions=1, which serializes every
+        # get_file/stream_media call. Stremio (and other players) open the main
+        # byte stream and concurrently Range-request the file tail to read the
+        # MP4 moov atom when it is not fast-started. With concurrency 1 the tail
+        # probe blocks behind the main download and playback never starts.
+        client_kwargs = dict(
+            api_id=Config.API_ID,
+            api_hash=Config.API_HASH,
+            in_memory=True,
+            no_updates=True,
+            max_concurrent_transmissions=8,
+        )
         if Config.USER_SESSION_STRING:
             logger.info("Initializing User Client...")
             self.client = Client(
                 name="tg_stremio_user",
-                api_id=Config.API_ID,
-                api_hash=Config.API_HASH,
                 session_string=Config.USER_SESSION_STRING,
-                in_memory=True,
-                no_updates=True
+                **client_kwargs,
             )
         elif Config.BOT_TOKEN:
             logger.info("Initializing Bot Client...")
             self.client = Client(
                 name="tg_stremio_bot",
-                api_id=Config.API_ID,
-                api_hash=Config.API_HASH,
                 bot_token=Config.BOT_TOKEN,
-                in_memory=True,
-                no_updates=True
+                **client_kwargs,
             )
         else:
             raise ValueError("Neither USER_SESSION_STRING nor BOT_TOKEN is configured!")
