@@ -131,6 +131,41 @@ async def test_build_stream_from_mapping_empty_message_ids_returns_none():
 
 
 @pytest.mark.asyncio
+async def test_build_stream_from_mapping_torbox_url():
+    Config.TORBOX_API_KEY = "torbox-secret"
+    mapping = {
+        "source": "torbox",
+        "torbox_kind": "webdl",
+        "torbox_id": 99,
+        "torbox_file_id": 2,
+        "file_name": "Movie.mkv",
+        "official_title": "TorBox Movie",
+        "resolution": "1080p",
+        "tags": [],
+    }
+    stream = await addon.build_stream_from_mapping(mapping)
+    assert stream["name"] == "TorBox [1080p]"
+    assert stream["title"] == "TorBox Movie"
+    assert "api/webdl/requestdl" in stream["url"]
+    assert "web_id=99" in stream["url"]
+    assert "token=torbox-secret" in stream["url"]
+
+
+@pytest.mark.asyncio
+async def test_build_stream_from_mapping_torbox_without_config_returns_none():
+    Config.TORBOX_API_KEY = ""
+    mapping = {
+        "source": "torbox",
+        "torbox_kind": "webdl",
+        "torbox_id": 1,
+        "torbox_file_id": 0,
+        "declared_title": "x",
+    }
+    result = await addon.build_stream_from_mapping(mapping)
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_stream_handler_tt_uses_supabase_mapping_before_cinemeta():
     """Supabase-first: if a mapping exists for the tt id, Cinemeta and the
     Telegram fuzzy search must never be invoked."""

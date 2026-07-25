@@ -1260,12 +1260,37 @@ async def find_subtitles_for_video(video_filename: str, api_key: str = "", cache
 async def build_stream_from_mapping(mapping: dict, api_key: str = "") -> dict:
     """Build a Stremio stream item directly from an approved Supabase mapping,
     skipping Cinemeta lookup and fuzzy Telegram search entirely."""
-    chat_id = mapping.get("source_chat_id")
-    message_ids = mapping.get("message_ids") or []
-    zip_entry = mapping.get("zip_entry")
     file_name = mapping.get("file_name") or "video.mp4"
     title = format_mapping_title(mapping, fallback=file_name)
     resolution = mapping.get("resolution")
+    source = mapping.get("source") or "telegram"
+
+    if source == "torbox" or mapping.get("torbox_id"):
+        import torbox_client
+
+        kind = mapping.get("torbox_kind") or "webdl"
+        torbox_id = mapping.get("torbox_id")
+        file_id = mapping.get("torbox_file_id") or 0
+        if not torbox_id or not torbox_client.is_configured():
+            return None
+        stream_url = await torbox_client.resolve_stream_url(kind, int(torbox_id), int(file_id))
+        if not stream_url:
+            return None
+        label = provider_label(resolution)
+        if label == "Telegram_bot":
+            label = "TorBox"
+        elif label.startswith("Telegram_bot"):
+            label = label.replace("Telegram_bot", "TorBox", 1)
+        return {
+            "name": label,
+            "title": title,
+            "url": stream_url,
+            "subtitles": [],
+            "behaviorHints": {"notWebReady": True},
+        }
+
+    chat_id = mapping.get("source_chat_id")
+    message_ids = mapping.get("message_ids") or []
 
     if not message_ids:
         return None
@@ -1278,6 +1303,7 @@ async def build_stream_from_mapping(mapping: dict, api_key: str = "") -> dict:
 
     query_param = f"?api_key={api_key}" if api_key else ""
     msg_ids_csv = ",".join(str(m) for m in message_ids)
+    zip_entry = mapping.get("zip_entry")
 
     if zip_entry:
         stream_url = f"{Config.ADDON_URL}/stream/zip/{chat_id}/{msg_ids_csv}/{urllib.parse.quote(zip_entry)}{query_param}"
