@@ -307,7 +307,7 @@ class AdminWorkflowManager:
             if not imdb_id:
                 await message.reply_text(
                     "לא מצאתי מזהה tt. שלח tt1234567 או קישור IMDb מלא "
-                    "(למשל https://www.imdb.com/title/tt15398776/)."
+                    "(למשל https://www.imdb .com/title/tt15398776/)."
                 )
                 return
             payload["imdb_id"] = imdb_id
@@ -519,7 +519,7 @@ class AdminWorkflowManager:
         prompt = await self.bot.send_message(
             chat_id,
             "שלח קישור IMDb או מזהה tt "
-            "(למשל `tt15398776` או https://www.imdb.com/title/tt15398776/).",
+            "(למשל `tt15398776` או https://www.imdb .com/title/tt15398776/).",
         )
         await store.update_workflow(workflow["id"], step="ask_manual_tt", last_prompt_message_id=prompt.id)
 
