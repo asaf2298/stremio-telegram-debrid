@@ -20,6 +20,7 @@ from config import Config
 from tg_client import tg_client_manager
 from tg_admin_workflow import admin_workflow_manager
 import metadata_store as store
+import host_busy
 from utils import (
     format_size,
     matches_episode,
@@ -1919,55 +1920,57 @@ async def tg_stream_proxy(
         
     async def file_generator():
         nonlocal msg
-        bytes_sent = 0
-        bytes_to_skip = skip_bytes
-        retry_count = 0
-        max_retries = 2
-        current_offset = offset
-        
-        while retry_count <= max_retries:
-            try:
-                # Stream using message object
-                async for chunk in tg_client_manager.client.stream_media(msg, offset=current_offset):
-                    if bytes_to_skip > 0:
-                        if bytes_to_skip < len(chunk):
-                            chunk = chunk[bytes_to_skip:]
-                            bytes_to_skip = 0
-                        else:
-                            bytes_to_skip -= len(chunk)
-                            continue
+        stream_key = f"file/{chat_id_val}/{message_id}/{filename}"
+        async with host_busy.telegram_stream_guard(stream_key):
+            bytes_sent = 0
+            bytes_to_skip = skip_bytes
+            retry_count = 0
+            max_retries = 2
+            current_offset = offset
+            
+            while retry_count <= max_retries:
+                try:
+                    # Stream using message object
+                    async for chunk in tg_client_manager.client.stream_media(msg, offset=current_offset):
+                        if bytes_to_skip > 0:
+                            if bytes_to_skip < len(chunk):
+                                chunk = chunk[bytes_to_skip:]
+                                bytes_to_skip = 0
+                            else:
+                                bytes_to_skip -= len(chunk)
+                                continue
+                                
+                        if bytes_sent + len(chunk) > content_length:
+                            chunk = chunk[:content_length - bytes_sent]
                             
-                    if bytes_sent + len(chunk) > content_length:
-                        chunk = chunk[:content_length - bytes_sent]
+                        yield chunk
+                        bytes_sent += len(chunk)
                         
-                    yield chunk
-                    bytes_sent += len(chunk)
-                    
-                    if bytes_sent >= content_length:
-                        break
-                # Stream completed successfully
-                break
-            except asyncio.CancelledError:
-                logger.info(f"Streaming cancelled by client for message {message_id}")
-                break
-            except Exception as e:
-                err_str = str(e).upper()
-                is_expired = "FILEREFERENCEEXPIRED" in type(e).__name__.upper() or "FILE_REFERENCE" in err_str
-                if is_expired and retry_count < max_retries:
-                    retry_count += 1
-                    logger.warning(f"File reference expired for message {message_id}, refreshing and retrying ({retry_count}/{max_retries})")
-                    try:
-                        msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=message_id)
-                        total_bytes_streamed = start + bytes_sent
-                        current_offset = total_bytes_streamed // chunk_size
-                        bytes_to_skip = total_bytes_streamed % chunk_size
-                        continue
-                    except Exception as refresh_err:
-                        logger.error(f"Failed to refresh message for reference recovery: {refresh_err}")
-                        break
-                else:
-                    logger.error(f"Streaming error on message {message_id}: {e}")
+                        if bytes_sent >= content_length:
+                            break
+                    # Stream completed successfully
                     break
+                except asyncio.CancelledError:
+                    logger.info(f"Streaming cancelled by client for message {message_id}")
+                    break
+                except Exception as e:
+                    err_str = str(e).upper()
+                    is_expired = "FILEREFERENCEEXPIRED" in type(e).__name__.upper() or "FILE_REFERENCE" in err_str
+                    if is_expired and retry_count < max_retries:
+                        retry_count += 1
+                        logger.warning(f"File reference expired for message {message_id}, refreshing and retrying ({retry_count}/{max_retries})")
+                        try:
+                            msg = await tg_client_manager.client.get_messages(chat_id=chat_id_val, message_ids=message_id)
+                            total_bytes_streamed = start + bytes_sent
+                            current_offset = total_bytes_streamed // chunk_size
+                            bytes_to_skip = total_bytes_streamed % chunk_size
+                            continue
+                        except Exception as refresh_err:
+                            logger.error(f"Failed to refresh message for reference recovery: {refresh_err}")
+                            break
+                    else:
+                        logger.error(f"Streaming error on message {message_id}: {e}")
+                        break
             
     logger.info(f"Streaming media '{log_safe(filename)}' (bytes {start}-{end}/{file_size}) - Status {status_code}")
     
@@ -2059,53 +2062,55 @@ async def tg_split_stream_proxy(
         )
         
     async def split_file_generator():
-        bytes_sent = 0
-        block_size = 1024 * 1024  # 1 MB blocks
-        
-        for chunk in chunks_info:
-            c_start = chunk["start_byte"]
-            c_end = chunk["end_byte"]
+        stream_key = f"split/{chat_id_val}/{message_ids}/{filename}"
+        async with host_busy.telegram_stream_guard(stream_key):
+            bytes_sent = 0
+            block_size = 1024 * 1024  # 1 MB blocks
             
-            if c_end < start or c_start > end:
-                continue
+            for chunk in chunks_info:
+                c_start = chunk["start_byte"]
+                c_end = chunk["end_byte"]
                 
-            read_start = max(c_start, start)
-            read_end = min(c_end, end)
-            chunk_read_len = read_end - read_start + 1
-            
-            local_offset = read_start - c_start
-            offset_blocks = local_offset // block_size
-            skip_bytes = local_offset % block_size
-            
-            chunk_bytes_sent = 0
-            bytes_to_skip = skip_bytes
-            
-            try:
-                # Stream using message object
-                async for block in tg_client_manager.client.stream_media(chunk["msg"], offset=offset_blocks):
-                    if bytes_to_skip > 0:
-                        if bytes_to_skip < len(block):
-                            block = block[bytes_to_skip:]
-                            bytes_to_skip = 0
-                        else:
-                            bytes_to_skip -= len(block)
-                            continue
-                            
-                    if chunk_bytes_sent + len(block) > chunk_read_len:
-                        block = block[:chunk_read_len - chunk_bytes_sent]
-                        
-                    yield block
-                    chunk_bytes_sent += len(block)
-                    bytes_sent += len(block)
+                if c_end < start or c_start > end:
+                    continue
                     
-                    if chunk_bytes_sent >= chunk_read_len:
-                        break
-            except Exception as e:
-                logger.error(f"Error streaming split chunk: {e}")
-                break
+                read_start = max(c_start, start)
+                read_end = min(c_end, end)
+                chunk_read_len = read_end - read_start + 1
                 
-            if bytes_sent >= content_length:
-                break
+                local_offset = read_start - c_start
+                offset_blocks = local_offset // block_size
+                skip_bytes = local_offset % block_size
+                
+                chunk_bytes_sent = 0
+                bytes_to_skip = skip_bytes
+                
+                try:
+                    # Stream using message object
+                    async for block in tg_client_manager.client.stream_media(chunk["msg"], offset=offset_blocks):
+                        if bytes_to_skip > 0:
+                            if bytes_to_skip < len(block):
+                                block = block[bytes_to_skip:]
+                                bytes_to_skip = 0
+                            else:
+                                bytes_to_skip -= len(block)
+                                continue
+                                
+                        if chunk_bytes_sent + len(block) > chunk_read_len:
+                            block = block[:chunk_read_len - chunk_bytes_sent]
+                            
+                        yield block
+                        chunk_bytes_sent += len(block)
+                        bytes_sent += len(block)
+                        
+                        if chunk_bytes_sent >= chunk_read_len:
+                            break
+                except Exception as e:
+                    logger.error(f"Error streaming split chunk: {e}")
+                    break
+                    
+                if bytes_sent >= content_length:
+                    break
                 
     logger.info(f"Streaming split media '{log_safe(filename)}' (bytes {start}-{end}/{total_size}) - Status {status_code}")
     
@@ -2221,53 +2226,55 @@ async def tg_zip_stream_proxy(
             total_size += part["size"]
             
         async def split_file_generator():
-            bytes_sent = 0
-            block_size = 1024 * 1024
-            
-            for chunk in chunks_info:
-                c_start = chunk["start_byte"]
-                c_end = chunk["end_byte"]
+            stream_key = f"zip/{chat_id_val}/{message_ids}/{filename}"
+            async with host_busy.telegram_stream_guard(stream_key):
+                bytes_sent = 0
+                block_size = 1024 * 1024
                 
-                if c_end < stream_start or c_start > stream_end:
-                    continue
+                for chunk in chunks_info:
+                    c_start = chunk["start_byte"]
+                    c_end = chunk["end_byte"]
                     
-                read_start = max(c_start, stream_start)
-                read_end = min(c_end, stream_end)
-                chunk_read_len = read_end - read_start + 1
-                
-                local_offset = read_start - c_start
-                offset_blocks = local_offset // block_size
-                skip_bytes = local_offset % block_size
-                
-                chunk_bytes_sent = 0
-                bytes_to_skip = skip_bytes
-                
-                try:
-                    # Stream using message object
-                    async for block in tg_client_manager.client.stream_media(chunk["message"], offset=offset_blocks):
-                        if bytes_to_skip > 0:
-                            if bytes_to_skip < len(block):
-                                block = block[bytes_to_skip:]
-                                bytes_to_skip = 0
-                            else:
-                                bytes_to_skip -= len(block)
-                                continue
-                                
-                        if chunk_bytes_sent + len(block) > chunk_read_len:
-                            block = block[:chunk_read_len - chunk_bytes_sent]
-                            
-                        yield block
-                        chunk_bytes_sent += len(block)
-                        bytes_sent += len(block)
+                    if c_end < stream_start or c_start > stream_end:
+                        continue
                         
-                        if chunk_bytes_sent >= chunk_read_len:
-                            break
-                except Exception as e:
-                    logger.error(f"Error streaming split ZIP chunk: {e}")
-                    break
+                    read_start = max(c_start, stream_start)
+                    read_end = min(c_end, stream_end)
+                    chunk_read_len = read_end - read_start + 1
                     
-                if bytes_sent >= stream_len:
-                    break
+                    local_offset = read_start - c_start
+                    offset_blocks = local_offset // block_size
+                    skip_bytes = local_offset % block_size
+                    
+                    chunk_bytes_sent = 0
+                    bytes_to_skip = skip_bytes
+                    
+                    try:
+                        # Stream using message object
+                        async for block in tg_client_manager.client.stream_media(chunk["message"], offset=offset_blocks):
+                            if bytes_to_skip > 0:
+                                if bytes_to_skip < len(block):
+                                    block = block[bytes_to_skip:]
+                                    bytes_to_skip = 0
+                                else:
+                                    bytes_to_skip -= len(block)
+                                    continue
+                                    
+                            if chunk_bytes_sent + len(block) > chunk_read_len:
+                                block = block[:chunk_read_len - chunk_bytes_sent]
+                                
+                            yield block
+                            chunk_bytes_sent += len(block)
+                            bytes_sent += len(block)
+                            
+                            if chunk_bytes_sent >= chunk_read_len:
+                                break
+                    except Exception as e:
+                        logger.error(f"Error streaming split ZIP chunk: {e}")
+                        break
+                        
+                    if bytes_sent >= stream_len:
+                        break
                     
         logger.info(f"Streaming uncompressed ZIP entry '{log_safe(filename)}' (raw bytes {stream_start}-{stream_end}/{total_size}) - Status {status_code}")
         return StreamingResponse(
@@ -2279,8 +2286,12 @@ async def tg_zip_stream_proxy(
     else:
         logger.info(f"ZIP entry '{log_safe(filename)}' is COMPRESSED (type {target_entry.compress_type}). Streaming on-the-fly decompression.")
         reader = TelegramSeekableReader(tg_client_manager.client, messages)
+        zip_stream_key = f"zip/{chat_id_val}/{message_ids}/{filename}"
         return StreamingResponse(
-            zip_compressed_generator(reader, filename, start, end),
+            host_busy.wrap_byte_stream(
+                zip_stream_key,
+                zip_compressed_generator(reader, filename, start, end),
+            ),
             status_code=status_code,
             media_type=mime_type,
             headers=headers
