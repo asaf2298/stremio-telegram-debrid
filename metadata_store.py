@@ -290,3 +290,28 @@ async def update_workflow(workflow_id: str, **fields) -> Optional[dict]:
 
 async def mark_workflow_status(workflow_id: str, status: str) -> Optional[dict]:
     return await update_workflow(workflow_id, status=status)
+
+
+# ---------------------------------------------------------------------------
+# personal_host_busy (shared VPS lock for ffmpeg / sync workers)
+# ---------------------------------------------------------------------------
+
+async def get_host_busy(host_id: str = "default") -> Optional[dict]:
+    params = {"id": f"eq.{host_id}", "select": "*", "limit": "1"}
+    rows = await _request("GET", "personal_host_busy", params=params)
+    return rows[0] if rows else None
+
+
+async def upsert_host_busy(payload: dict) -> Optional[dict]:
+    host_id = payload.get("id", "default")
+    existing = await get_host_busy(host_id)
+    if existing:
+        result = await _request(
+            "PATCH",
+            "personal_host_busy",
+            params={"id": f"eq.{host_id}"},
+            json=payload,
+        )
+    else:
+        result = await _request("POST", "personal_host_busy", json=payload)
+    return result[0] if result else None
