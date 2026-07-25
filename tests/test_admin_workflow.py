@@ -211,7 +211,7 @@ async def test_content_flow_tmdb_lists_candidates_for_selection():
 
 
 @pytest.mark.asyncio
-async def test_select_tmdb_candidate_resolves_imdb_and_continues():
+async def test_select_tmdb_candidate_resolves_imdb_and_shows_confirm():
     _configure_enabled()
     mgr = _manager()
     workflow = {
@@ -239,13 +239,87 @@ async def test_select_tmdb_candidate_resolves_imdb_and_continues():
         new=AsyncMock(return_value={"imdb_id": "tt15398776"}),
     ), \
          patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()), \
-         patch.object(mgr, "_after_imdb_resolved", new=AsyncMock()) as mock_after:
+         patch.object(mgr, "_confirm_imdb_pick", new=AsyncMock()) as mock_confirm:
         await mgr._select_tmdb_candidate(Config.MANAGEMENT_GROUP_ID, workflow, 0)
 
     assert workflow["payload"]["imdb_id"] == "tt15398776"
     assert workflow["payload"]["official_title"] == "אופנהיימר"
     assert workflow["payload"]["tmdb_id"] == 872585
-    mock_after.assert_awaited_once()
+    mock_confirm.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_confirm_imdb_pick_shows_link_and_buttons():
+    _configure_enabled()
+    mgr = _manager()
+    prompt = SimpleNamespace(id=321)
+    mgr.bot.send_message = AsyncMock(return_value=prompt)
+    workflow = {
+        "id": "wf-2c",
+        "chat_id": Config.MANAGEMENT_GROUP_ID,
+        "payload": {
+            "official_title": "Oppenheimer",
+            "imdb_id": "tt15398776",
+        },
+    }
+
+    with patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()) as mock_update:
+        await mgr._confirm_imdb_pick(Config.MANAGEMENT_GROUP_ID, workflow)
+
+    text = mgr.bot.send_message.call_args[0][1]
+    assert "tt15398776" in text
+    markup = mgr.bot.send_message.call_args.kwargs["reply_markup"]
+    labels = [btn.text for row in markup.inline_keyboard for btn in row]
+    assert "בדיוק" in labels
+    assert "אחד אחר" in labels
+    assert mock_update.call_args.kwargs["step"] == "confirm_imdb"
+
+
+@pytest.mark.asyncio
+async def test_ask_title_uses_approve_and_other_buttons():
+    _configure_enabled()
+    mgr = _manager()
+    prompt = SimpleNamespace(id=11)
+    mgr.bot.send_message = AsyncMock(return_value=prompt)
+    workflow = {
+        "id": "wf-title",
+        "payload": {"file_name": "HDTV 1997 נתי מדיה הרקולס מדובב.avi"},
+    }
+
+    with patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()) as mock_update:
+        await mgr._ask_title(Config.MANAGEMENT_GROUP_ID, workflow)
+
+    text = mgr.bot.send_message.call_args[0][1]
+    assert "האם לחפש את שם הסרט ב imdb" in text
+    assert "HDTV 1997" in text
+    labels = [
+        btn.text
+        for row in mgr.bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard
+        for btn in row
+    ]
+    assert labels == ["אישור", "שם אחר"]
+    assert mock_update.call_args.kwargs["step"] == "ask_title"
+
+
+@pytest.mark.asyncio
+async def test_title_approve_uses_detected_filename_for_search():
+    _configure_enabled()
+    mgr = _manager()
+    workflow = {
+        "id": "wf-ta",
+        "chat_id": Config.MANAGEMENT_GROUP_ID,
+        "status": "open",
+        "payload": {"file_name": "Detected.mkv", "caption": ""},
+    }
+
+    with patch("tg_admin_workflow.store.get_workflow", new=AsyncMock(return_value=workflow)), \
+         patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()), \
+         patch.object(mgr, "_search_and_confirm", new=AsyncMock()) as mock_search:
+        cq = _fake_cq("wf-ta", "ta")
+        await mgr._on_callback(cq)
+
+    assert workflow["payload"]["declared_title"] == "Detected.mkv"
+    mock_search.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -343,14 +417,14 @@ def test_extract_imdb_id_from_various_inputs():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_continue_with_declared_name_clears_imdb_fields():
+async def test_continue_with_declared_name_sets_personal_classification():
     _configure_enabled()
     mgr = _manager()
     workflow = {
         "id": "wf-5",
         "chat_id": Config.MANAGEMENT_GROUP_ID,
         "status": "open",
-        "payload": {"declared_title": "My Custom Rip", "stremio_type": "movie"},
+        "payload": {"declared_title": "My Custom Rip", "stremio_type": "series"},
     }
     with patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()), \
          patch.object(mgr, "_after_imdb_resolved", new=AsyncMock()) as mock_after:
@@ -359,7 +433,30 @@ async def test_continue_with_declared_name_clears_imdb_fields():
     assert workflow["payload"]["imdb_id"] is None
     assert workflow["payload"]["official_title"] is None
     assert workflow["payload"]["tmdb_id"] is None
+    assert workflow["payload"]["classification"] == "personal"
+    sent = mgr.bot.send_message.call_args[0][1]
+    assert "Personal" in sent
+    assert "סדרה" in sent
     mock_after.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ask_no_candidate_offers_continue_without_id():
+    _configure_enabled()
+    mgr = _manager()
+    prompt = SimpleNamespace(id=55)
+    mgr.bot.send_message = AsyncMock(return_value=prompt)
+    workflow = {"id": "wf-nc", "payload": {}}
+
+    with patch("tg_admin_workflow.store.update_workflow", new=AsyncMock()):
+        await mgr._ask_no_candidate(Config.MANAGEMENT_GROUP_ID, workflow)
+
+    labels = [
+        btn.text
+        for row in mgr.bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard
+        for btn in row
+    ]
+    assert any("המשך ללא מזהה" in label for label in labels)
 
 
 # ---------------------------------------------------------------------------
@@ -511,9 +608,54 @@ async def test_callback_rejected_when_workflow_not_open():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_finalize_cleans_workflow_messages_keeps_source_and_success():
+    _configure_enabled()
+    mgr = _manager()
+    success_msg = SimpleNamespace(id=9999)
+    mgr.bot.send_message = AsyncMock(return_value=success_msg)
+    mgr.bot.delete_messages = AsyncMock()
+    workflow = {
+        "id": "wf-clean",
+        "chat_id": Config.MANAGEMENT_GROUP_ID,
+        "source_message_id": 100,
+        "created_by": 1,
+        "payload": {
+            "message_ids": [100],
+            "file_name": "movie.mkv",
+            "declared_title": "Movie",
+            "classification": "movie",
+            "stremio_type": "movie",
+            "cleanup_message_ids": [200, 201, 202],
+        },
+    }
+
+    with patch("tg_admin_workflow.store.upsert_media_mapping", new=AsyncMock(return_value={"id": "m-1"})), \
+         patch("tg_admin_workflow.store.mark_workflow_status", new=AsyncMock()):
+        await mgr._finalize(Config.MANAGEMENT_GROUP_ID, workflow)
+
+    mgr.bot.delete_messages.assert_awaited()
+    deleted = set(mgr.bot.delete_messages.await_args.args[1])
+    assert deleted == {200, 201, 202}
+    assert 100 not in deleted
+    assert 9999 not in deleted
+
+
+def test_remember_cleanup_id_dedupes():
+    workflow = {"payload": {"cleanup_message_ids": [1]}}
+    from tg_admin_workflow import _remember_cleanup_id
+
+    _remember_cleanup_id(workflow, 2)
+    _remember_cleanup_id(workflow, 2)
+    assert workflow["payload"]["cleanup_message_ids"] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_finalize_persists_torbox_fields():
     _configure_enabled()
     mgr = _manager()
+    success_msg = SimpleNamespace(id=8888)
+    mgr.bot.send_message = AsyncMock(return_value=success_msg)
+    mgr.bot.delete_messages = AsyncMock()
     workflow = {
         "id": "wf-tb",
         "chat_id": Config.MANAGEMENT_GROUP_ID,
