@@ -80,6 +80,22 @@ def _candidate_button_label(candidate: dict) -> str:
     return label
 
 
+def _remember_cleanup_id(workflow: dict, message_id: int) -> None:
+    """Append a group message id to the workflow's deletable noise list."""
+    if not message_id:
+        return
+    payload = workflow.get("payload")
+    if payload is None:
+        workflow["payload"] = payload = {}
+    ids = payload.get("cleanup_message_ids")
+    if not isinstance(ids, list):
+        ids = []
+    mid = int(message_id)
+    if mid not in ids:
+        ids.append(mid)
+    payload["cleanup_message_ids"] = ids
+
+
 class AdminWorkflowManager:
     def __init__(self):
         self.bot: Client = None
@@ -179,6 +195,77 @@ class AdminWorkflowManager:
         filters.chat() can't be used here — check manually instead."""
         return bool(cq.message and cq.message.chat.id == Config.MANAGEMENT_GROUP_ID)
 
+    async def _persist_workflow_payload(self, workflow: dict) -> None:
+        payload = workflow.get("payload")
+        if payload is None:
+            return
+        await store.update_workflow(workflow["id"], payload=payload)
+
+    async def _track_bot_message(self, workflow: dict, message, *, persist: bool = True) -> int | None:
+        if not message:
+            return None
+        mid = getattr(message, "id", None)
+        _remember_cleanup_id(workflow, mid)
+        if persist:
+            await self._persist_workflow_payload(workflow)
+        return mid
+
+    async def _track_user_reply(self, workflow: dict, message: Message) -> None:
+        _remember_cleanup_id(workflow, message.id)
+        await self._persist_workflow_payload(workflow)
+
+    async def _cleanup_workflow_chat(
+        self, chat_id: int, workflow: dict, *, keep_message_ids: set[int] | None = None
+    ) -> None:
+        """Delete workflow Q&A noise for all group members. Keeps source file/link + success."""
+        keep = {int(x) for x in (keep_message_ids or set()) if x}
+        source_id = workflow.get("source_message_id")
+        if source_id:
+            keep.add(int(source_id))
+
+        payload = workflow.get("payload") or {}
+        to_delete = [
+            int(mid)
+            for mid in (payload.get("cleanup_message_ids") or [])
+            if mid and int(mid) not in keep
+        ]
+        if not to_delete:
+            return
+
+        for i in range(0, len(to_delete), 100):
+            batch = to_delete[i : i + 100]
+            try:
+                await self.bot.delete_messages(chat_id, batch)
+            except Exception:
+                for mid in batch:
+                    try:
+                        await self.bot.delete_messages(chat_id, mid)
+                    except Exception as e:
+                        logger.debug("Could not delete workflow message %s: %s", mid, e)
+
+    async def _set_workflow_prompt(
+        self,
+        workflow: dict,
+        *,
+        step: str,
+        message_id: int,
+        payload_patch: dict = None,
+        status: str = None,
+    ) -> None:
+        payload = dict(workflow.get("payload") or {})
+        if payload_patch:
+            payload.update(payload_patch)
+        workflow["payload"] = payload
+        _remember_cleanup_id(workflow, message_id)
+        fields = {
+            "step": step,
+            "last_prompt_message_id": message_id,
+            "payload": workflow["payload"],
+        }
+        if status:
+            fields["status"] = status
+        await store.update_workflow(workflow["id"], **fields)
+
     # ------------------------------------------------------------------
     # Upload entrypoint
     # ------------------------------------------------------------------
@@ -204,8 +291,10 @@ class AdminWorkflowManager:
             "message_ids": [message.id],
             "file_name": file_name,
             "caption": message.caption or "",
+            "cleanup_message_ids": [],
         }
         await store.update_workflow(workflow["id"], payload=payload)
+        workflow["payload"] = payload
 
         prompt = await message.reply_text(
             f"התקבל קובץ חדש: `{file_name}`\n\nהאם זה סרטון אישי?",
@@ -215,9 +304,7 @@ class AdminWorkflowManager:
                 ]
             ),
         )
-        await store.update_workflow(
-            workflow["id"], step="ask_personal", last_prompt_message_id=prompt.id
-        )
+        await self._set_workflow_prompt(workflow, step="ask_personal", message_id=prompt.id)
 
     # ------------------------------------------------------------------
     # TorBox link entry (API only — no TorBox Telegram bot parsing)
@@ -326,12 +413,14 @@ class AdminWorkflowManager:
             "message_ids": [],
             "caption": "",
             "original_url": url or magnet or "",
+            "cleanup_message_ids": [],
         }
         await store.update_workflow(workflow["id"], payload=payload)
         workflow["payload"] = payload
 
         if torbox_client.is_ready(item):
-            await message.reply_text(f"✅ נמצא ב-TorBox: `{file_name}`\nמתחיל שאלות זיהוי…")
+            note = await message.reply_text(f"✅ נמצא ב-TorBox: `{file_name}`\nמתחיל שאלות זיהוי…")
+            await self._track_bot_message(workflow, note)
             await self._ask_personal(chat_id, workflow)
         else:
             await self._begin_torbox_wait(chat_id, workflow, item)
@@ -349,13 +438,12 @@ class AdminWorkflowManager:
             reply_markup=_kb([[("❌ ביטול", _cb(workflow["id"], "tb_cancel"))]]),
         )
         payload["torbox_status_message_id"] = status.id
-        await store.update_workflow(
-            workflow["id"],
+        await self._set_workflow_prompt(
+            workflow,
             step="torbox_wait",
-            payload=payload,
-            last_prompt_message_id=status.id,
+            message_id=status.id,
+            payload_patch=payload,
         )
-        workflow["payload"] = payload
         cancel = asyncio.Event()
         self._torbox_cancel[workflow["id"]] = cancel
         asyncio.create_task(self._torbox_poll_loop(workflow["id"]))
@@ -396,11 +484,14 @@ class AdminWorkflowManager:
                 if torbox_client.is_ready(item):
                     payload["torbox_status"] = "ready"
                     await store.update_workflow(workflow_id, payload=payload, step="ask_personal")
-                    await self.bot.send_message(
+                    workflow = await store.get_workflow(workflow_id) or workflow
+                    workflow["payload"] = payload
+                    ready_note = await self.bot.send_message(
                         workflow["chat_id"],
                         f"✅ ההורדה ב-TorBox מוכנה: `{payload['file_name']}`\nמתחיל שאלות זיהוי…",
                     )
-                    await self._ask_personal(workflow["chat_id"], {**workflow, "payload": payload})
+                    await self._track_bot_message(workflow, ready_note)
+                    await self._ask_personal(workflow["chat_id"], workflow)
                     return
                 if (item.get("error") or "").strip():
                     await self.bot.send_message(
@@ -546,6 +637,7 @@ class AdminWorkflowManager:
                 "message_ids": payload.get("message_ids", []),
                 "file_name": payload.get("file_name", ""),
                 "caption": payload.get("caption", ""),
+                "cleanup_message_ids": payload.get("cleanup_message_ids") or [],
             }
             await store.update_workflow(workflow_id, payload=payload, status="open")
             workflow["payload"] = payload
@@ -569,8 +661,13 @@ class AdminWorkflowManager:
         chat_id = message.chat.id
         payload = workflow.get("payload") or {}
 
+        await self._track_user_reply(workflow, message)
+
         if step == "torbox_wait":
-            await message.reply_text("⏳ עדיין ממתין ל-TorBox. אפשר לבטל עם הכפתור בהודעת ההמתנה.")
+            hint = await message.reply_text(
+                "⏳ עדיין ממתין ל-TorBox. אפשר לבטל עם הכפתור בהודעת ההמתנה."
+            )
+            await self._track_bot_message(workflow, hint)
             return
 
         if step == "ask_personal_name":
@@ -586,16 +683,18 @@ class AdminWorkflowManager:
             await self._search_and_confirm(chat_id, workflow)
 
         elif step == "ask_title":
-            await message.reply_text("השתמש בכפתורים בהודעה למעלה: אישור או שם אחר.")
+            hint = await message.reply_text("השתמש בכפתורים בהודעה למעלה: אישור או שם אחר.")
+            await self._track_bot_message(workflow, hint)
             return
 
         elif step == "ask_manual_tt":
             imdb_id = extract_imdb_id(text)
             if not imdb_id:
-                await message.reply_text(
+                err = await message.reply_text(
                     "לא מצאתי מזהה tt. שלח tt1234567 או קישור IMDb מלא "
-                    "(למשל https://www.imdb .com/title/tt15398776/)."
+                    "(למשל https://www.imdb.com/title/tt15398776/)."
                 )
+                await self._track_bot_message(workflow, err)
                 return
             payload["imdb_id"] = imdb_id
             try:
@@ -615,9 +714,10 @@ class AdminWorkflowManager:
                 if m2:
                     season, episode = int(m2.group(1)), int(m2.group(2))
                 else:
-                    await message.reply_text(
+                    err = await message.reply_text(
                         "לא הצלחתי להבין. שלח בפורמט S01E02 או 1x02."
                     )
+                    await self._track_bot_message(workflow, err)
                     return
             else:
                 season, episode = int(m.group(1)), int(m.group(2))
@@ -649,17 +749,17 @@ class AdminWorkflowManager:
                 [[("כן, אישי", _cb(workflow["id"], "py")), ("לא, חפש תוכן", _cb(workflow["id"], "pn"))]]
             ),
         )
-        await store.update_workflow(workflow["id"], step="ask_personal", last_prompt_message_id=prompt.id)
+        await self._set_workflow_prompt(workflow, step="ask_personal", message_id=prompt.id)
 
     async def _ask_personal_name(self, chat_id: int, workflow: dict):
         prompt = await self.bot.send_message(
             chat_id, f"איך להציג את הסרטון?{_REPLY_HINT}"
         )
-        await store.update_workflow(
-            workflow["id"],
+        await self._set_workflow_prompt(
+            workflow,
             step="ask_personal_name",
-            last_prompt_message_id=prompt.id,
-            payload={**(workflow.get("payload") or {}), "classification": "personal"},
+            message_id=prompt.id,
+            payload_patch={**(workflow.get("payload") or {}), "classification": "personal"},
         )
 
     async def _ask_category(self, chat_id: int, workflow: dict):
@@ -676,7 +776,7 @@ class AdminWorkflowManager:
                 ]
             ),
         )
-        await store.update_workflow(workflow["id"], step="ask_category", last_prompt_message_id=prompt.id)
+        await self._set_workflow_prompt(workflow, step="ask_category", message_id=prompt.id)
 
     async def _ask_anime_subtype(self, chat_id: int, workflow: dict):
         prompt = await self.bot.send_message(
@@ -684,7 +784,7 @@ class AdminWorkflowManager:
             "אנימה - סרט או סדרה?",
             reply_markup=_kb([[("סרט", _cb(workflow["id"], "am")), ("סדרה", _cb(workflow["id"], "as"))]]),
         )
-        await store.update_workflow(workflow["id"], step="ask_anime_subtype", last_prompt_message_id=prompt.id)
+        await self._set_workflow_prompt(workflow, step="ask_anime_subtype", message_id=prompt.id)
 
     async def _ask_title(self, chat_id: int, workflow: dict):
         payload = workflow.get("payload") or {}
@@ -698,15 +798,13 @@ class AdminWorkflowManager:
                 [[("אישור", _cb(workflow["id"], "ta")), ("שם אחר", _cb(workflow["id"], "tn"))]]
             ),
         )
-        await store.update_workflow(workflow["id"], step="ask_title", last_prompt_message_id=prompt.id)
+        await self._set_workflow_prompt(workflow, step="ask_title", message_id=prompt.id)
 
     async def _ask_title_other(self, chat_id: int, workflow: dict):
         prompt = await self.bot.send_message(
             chat_id, f"מה שם הסרט/הסדרה לחיפוש?{_REPLY_HINT}"
         )
-        await store.update_workflow(
-            workflow["id"], step="ask_title_other", last_prompt_message_id=prompt.id
-        )
+        await self._set_workflow_prompt(workflow, step="ask_title_other", message_id=prompt.id)
 
     async def _search_and_confirm(self, chat_id: int, workflow: dict):
         payload = workflow.get("payload") or {}
@@ -759,7 +857,7 @@ class AdminWorkflowManager:
             f"(או הזן קישור / מזהה IMDb אם אף אחת לא מתאימה)",
             reply_markup=_kb(rows),
         )
-        await store.update_workflow(workflow["id"], step="ask_tmdb_confirm", last_prompt_message_id=prompt.id)
+        await self._set_workflow_prompt(workflow, step="ask_tmdb_confirm", message_id=prompt.id)
 
     async def _ask_no_candidate(self, chat_id: int, workflow: dict):
         prompt = await self.bot.send_message(
@@ -772,13 +870,14 @@ class AdminWorkflowManager:
                 ]]
             ),
         )
-        await store.update_workflow(workflow["id"], step="ask_tmdb_confirm", last_prompt_message_id=prompt.id)
+        await self._set_workflow_prompt(workflow, step="ask_tmdb_confirm", message_id=prompt.id)
 
     async def _select_tmdb_candidate(self, chat_id: int, workflow: dict, index: int):
         payload = workflow.get("payload") or {}
         candidates = payload.get("tmdb_candidates") or []
         if index < 0 or index >= len(candidates):
-            await self.bot.send_message(chat_id, "הבחירה לא תקפה. נסה שוב מהרשימה.")
+            err = await self.bot.send_message(chat_id, "הבחירה לא תקפה. נסה שוב מהרשימה.")
+            await self._track_bot_message(workflow, err)
             return
 
         candidate = candidates[index]
@@ -819,9 +918,7 @@ class AdminWorkflowManager:
                 ]]
             ),
         )
-        await store.update_workflow(
-            workflow["id"], step="confirm_imdb", last_prompt_message_id=prompt.id
-        )
+        await self._set_workflow_prompt(workflow, step="confirm_imdb", message_id=prompt.id)
 
     async def _apply_tmdb_candidate(self, chat_id: int, workflow: dict):
         payload = workflow.get("payload") or {}
@@ -847,11 +944,14 @@ class AdminWorkflowManager:
         type_label = _stremio_type_hebrew(stremio_type)
         await store.update_workflow(workflow["id"], payload=payload)
         workflow["payload"] = payload
-        await self.bot.send_message(
+        await store.update_workflow(workflow["id"], payload=payload)
+        workflow["payload"] = payload
+        note = await self.bot.send_message(
             chat_id,
             f"סווג כ־Personal (יופיע בקטלוג Personal Telegram).\n"
             f"סוג שנבחר: {type_label}.",
         )
+        await self._track_bot_message(workflow, note)
         await self._after_imdb_resolved(chat_id, workflow)
 
     async def _ask_manual_tt(self, chat_id: int, workflow: dict):
@@ -861,7 +961,7 @@ class AdminWorkflowManager:
             "(למשל `tt15398776` או https://www.imdb.com/title/tt15398776/)."
             f"{_REPLY_HINT}",
         )
-        await store.update_workflow(workflow["id"], step="ask_manual_tt", last_prompt_message_id=prompt.id)
+        await self._set_workflow_prompt(workflow, step="ask_manual_tt", message_id=prompt.id)
 
     async def _after_imdb_resolved(self, chat_id: int, workflow: dict):
         payload = workflow.get("payload") or {}
@@ -880,7 +980,7 @@ class AdminWorkflowManager:
             prompt = await self.bot.send_message(
                 chat_id, f"מה העונה והפרק? (לדוגמה: S01E02){_REPLY_HINT}"
             )
-            await store.update_workflow(workflow["id"], step="ask_season_episode", last_prompt_message_id=prompt.id)
+            await self._set_workflow_prompt(workflow, step="ask_season_episode", message_id=prompt.id)
             return
         await self._ask_tags(chat_id, workflow)
 
@@ -890,10 +990,7 @@ class AdminWorkflowManager:
             f"תגים אופציונליים (איכות/שפה)? למשל: 1080p, דיבוב עברית\nאו שלח \"דלג\".{_REPLY_HINT}",
         )
         step = "edit_tags" if editing else "ask_tags"
-        # Reopen the workflow in case it was already marked "done" (edit flow).
-        await store.update_workflow(
-            workflow["id"], step=step, last_prompt_message_id=prompt.id, status="open"
-        )
+        await self._set_workflow_prompt(workflow, step=step, message_id=prompt.id, status="open")
 
     async def _finalize(self, chat_id: int, workflow: dict):
         payload = workflow.get("payload") or {}
@@ -962,7 +1059,8 @@ class AdminWorkflowManager:
         #         ("🔄 קטגוריה חדשה", _cb(workflow["id"], "reclassify")),
         #     ]]
         # )
-        await self.bot.send_message(chat_id, "\n".join(summary_lines))
+        success = await self.bot.send_message(chat_id, "\n".join(summary_lines))
+        await self._cleanup_workflow_chat(chat_id, workflow, keep_message_ids={success.id})
 
 
 admin_workflow_manager = AdminWorkflowManager()

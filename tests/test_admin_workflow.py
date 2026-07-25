@@ -608,9 +608,54 @@ async def test_callback_rejected_when_workflow_not_open():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+async def test_finalize_cleans_workflow_messages_keeps_source_and_success():
+    _configure_enabled()
+    mgr = _manager()
+    success_msg = SimpleNamespace(id=9999)
+    mgr.bot.send_message = AsyncMock(return_value=success_msg)
+    mgr.bot.delete_messages = AsyncMock()
+    workflow = {
+        "id": "wf-clean",
+        "chat_id": Config.MANAGEMENT_GROUP_ID,
+        "source_message_id": 100,
+        "created_by": 1,
+        "payload": {
+            "message_ids": [100],
+            "file_name": "movie.mkv",
+            "declared_title": "Movie",
+            "classification": "movie",
+            "stremio_type": "movie",
+            "cleanup_message_ids": [200, 201, 202],
+        },
+    }
+
+    with patch("tg_admin_workflow.store.upsert_media_mapping", new=AsyncMock(return_value={"id": "m-1"})), \
+         patch("tg_admin_workflow.store.mark_workflow_status", new=AsyncMock()):
+        await mgr._finalize(Config.MANAGEMENT_GROUP_ID, workflow)
+
+    mgr.bot.delete_messages.assert_awaited()
+    deleted = set(mgr.bot.delete_messages.await_args.args[1])
+    assert deleted == {200, 201, 202}
+    assert 100 not in deleted
+    assert 9999 not in deleted
+
+
+def test_remember_cleanup_id_dedupes():
+    workflow = {"payload": {"cleanup_message_ids": [1]}}
+    from tg_admin_workflow import _remember_cleanup_id
+
+    _remember_cleanup_id(workflow, 2)
+    _remember_cleanup_id(workflow, 2)
+    assert workflow["payload"]["cleanup_message_ids"] == [1, 2]
+
+
+@pytest.mark.asyncio
 async def test_finalize_persists_torbox_fields():
     _configure_enabled()
     mgr = _manager()
+    success_msg = SimpleNamespace(id=8888)
+    mgr.bot.send_message = AsyncMock(return_value=success_msg)
+    mgr.bot.delete_messages = AsyncMock()
     workflow = {
         "id": "wf-tb",
         "chat_id": Config.MANAGEMENT_GROUP_ID,
