@@ -44,13 +44,22 @@ def _unwrap_data(resp_json: Any) -> Any:
     return resp_json
 
 
-async def _request(method: str, path: str, *, params: dict = None, json: dict = None) -> Any:
+async def _request(
+    method: str,
+    path: str,
+    *,
+    params: dict = None,
+    json: dict = None,
+    data: dict = None,
+) -> Any:
     if not is_configured():
         return None
     url = f"{BASE_URL}/{path.lstrip('/')}"
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT, follow_redirects=False) as client:
-            resp = await client.request(method, url, params=params, json=json, headers=_headers())
+            resp = await client.request(
+                method, url, params=params, json=json, data=data, headers=_headers()
+            )
             if resp.status_code >= 400:
                 logger.warning("TorBox %s %s failed: %s %s", method, path, resp.status_code, resp.text[:200])
                 return None
@@ -137,7 +146,7 @@ def item_ids(item: dict, kind: str) -> tuple[int, int]:
 
 
 async def create_web_download(url: str) -> Optional[dict]:
-    result = await _request("POST", "api/webdl/createwebdownload", json={"link": url})
+    result = await _request("POST", "api/webdl/createwebdownload", data={"link": url})
     if not result:
         return None
     data = _unwrap_data(result)
@@ -147,7 +156,7 @@ async def create_web_download(url: str) -> Optional[dict]:
 
 
 async def create_torrent(magnet: str) -> Optional[dict]:
-    result = await _request("POST", "api/torrents/createtorrent", json={"magnet": magnet})
+    result = await _request("POST", "api/torrents/createtorrent", data={"magnet": magnet})
     if not result:
         return None
     data = _unwrap_data(result)

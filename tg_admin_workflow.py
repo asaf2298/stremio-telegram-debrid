@@ -46,6 +46,11 @@ _TMDB_CHOICE_LIMIT = 15
 _BUTTON_LABEL_MAX = 60
 _TORBOX_POLL_SECONDS = 10
 _TORBOX_POLL_MAX_MINUTES = 180
+_REPLY_HINT = "\n\nיש לצוטט את התשובה"
+
+
+def _stremio_type_hebrew(stremio_type: str) -> str:
+    return "סדרה" if stremio_type == "series" else "סרט"
 
 
 def extract_imdb_id(text: str) -> str | None:
@@ -510,9 +515,19 @@ class AdminWorkflowManager:
             await store.update_workflow(workflow_id, payload=payload)
             workflow["payload"] = payload
             await self._ask_title(chat_id, workflow)
-        elif action == "tc_approve":
-            # Legacy single-candidate approve (kept for in-flight messages).
+        elif action == "tc_approve" or action == "im_ok":
             await self._apply_tmdb_candidate(chat_id, workflow)
+        elif action == "im_retry":
+            await self._show_tmdb_candidate_list(chat_id, workflow)
+        elif action == "ta":
+            payload["declared_title"] = (
+                payload.get("file_name") or payload.get("caption") or payload.get("declared_title") or ""
+            )
+            await store.update_workflow(workflow_id, payload=payload)
+            workflow["payload"] = payload
+            await self._search_and_confirm(chat_id, workflow)
+        elif action == "tn":
+            await self._ask_title_other(chat_id, workflow)
         elif action.startswith("tp_"):
             try:
                 idx = int(action[3:])
@@ -564,11 +579,15 @@ class AdminWorkflowManager:
             workflow["payload"] = payload
             await self._ask_tags(chat_id, workflow)
 
-        elif step == "ask_title":
+        elif step == "ask_title_other":
             payload["declared_title"] = text
             await store.update_workflow(workflow["id"], payload=payload)
             workflow["payload"] = payload
             await self._search_and_confirm(chat_id, workflow)
+
+        elif step == "ask_title":
+            await message.reply_text("השתמש בכפתורים בהודעה למעלה: אישור או שם אחר.")
+            return
 
         elif step == "ask_manual_tt":
             imdb_id = extract_imdb_id(text)
@@ -633,7 +652,9 @@ class AdminWorkflowManager:
         await store.update_workflow(workflow["id"], step="ask_personal", last_prompt_message_id=prompt.id)
 
     async def _ask_personal_name(self, chat_id: int, workflow: dict):
-        prompt = await self.bot.send_message(chat_id, "איך להציג את הסרטון?")
+        prompt = await self.bot.send_message(
+            chat_id, f"איך להציג את הסרטון?{_REPLY_HINT}"
+        )
         await store.update_workflow(
             workflow["id"],
             step="ask_personal_name",
@@ -670,10 +691,22 @@ class AdminWorkflowManager:
         detected = payload.get("file_name") or payload.get("caption") or ""
         prompt = await self.bot.send_message(
             chat_id,
-            f"מה שם הסרט/הסדרה?\nהשם שזוהה מהקובץ: `{detected}`\n"
-            f"שלח שם, או שלח \"אישור\" כדי להשתמש בשם שזוהה.",
+            f"מה שם הסרט/הסדרה?\n"
+            f"השם שזוהה מהקובץ: {detected}\n"
+            f"האם לחפש את שם הסרט ב imdb או שתרצה שאחפש שם אחר?",
+            reply_markup=_kb(
+                [[("אישור", _cb(workflow["id"], "ta")), ("שם אחר", _cb(workflow["id"], "tn"))]]
+            ),
         )
         await store.update_workflow(workflow["id"], step="ask_title", last_prompt_message_id=prompt.id)
+
+    async def _ask_title_other(self, chat_id: int, workflow: dict):
+        prompt = await self.bot.send_message(
+            chat_id, f"מה שם הסרט/הסדרה לחיפוש?{_REPLY_HINT}"
+        )
+        await store.update_workflow(
+            workflow["id"], step="ask_title_other", last_prompt_message_id=prompt.id
+        )
 
     async def _search_and_confirm(self, chat_id: int, workflow: dict):
         payload = workflow.get("payload") or {}
@@ -703,10 +736,18 @@ class AdminWorkflowManager:
         payload.pop("tmdb_candidate_imdb", None)
         await store.update_workflow(workflow["id"], payload=payload)
         workflow["payload"] = payload
+        await self._show_tmdb_candidate_list(chat_id, workflow)
+
+    async def _show_tmdb_candidate_list(self, chat_id: int, workflow: dict):
+        payload = workflow.get("payload") or {}
+        candidates = payload.get("tmdb_candidates") or []
+        if not candidates:
+            await self._ask_no_candidate(chat_id, workflow)
+            return
 
         rows = [
             [(_candidate_button_label(d), _cb(workflow["id"], f"tp_{i}"))]
-            for i, d in enumerate(payload["tmdb_candidates"])
+            for i, d in enumerate(candidates)
         ]
         rows.append(
             [("🔢 להזין קישור / tt מ־IMDb", _cb(workflow["id"], "tc_manual"))]
@@ -727,7 +768,7 @@ class AdminWorkflowManager:
             reply_markup=_kb(
                 [[
                     ("🔢 להזין קישור / tt מ־IMDb", _cb(workflow["id"], "mt_from_confirm")),
-                    ("➡️ המשך עם השם", _cb(workflow["id"], "un")),
+                    ("➡️ המשך ללא מזהה", _cb(workflow["id"], "un")),
                 ]]
             ),
         )
@@ -758,7 +799,29 @@ class AdminWorkflowManager:
         payload["imdb_id"] = imdb_id
         await store.update_workflow(workflow["id"], payload=payload)
         workflow["payload"] = payload
-        await self._after_imdb_resolved(chat_id, workflow)
+        await self._confirm_imdb_pick(chat_id, workflow)
+
+    async def _confirm_imdb_pick(self, chat_id: int, workflow: dict):
+        payload = workflow.get("payload") or {}
+        title = payload.get("official_title") or payload.get("declared_title") or "ללא שם"
+        imdb_id = payload.get("imdb_id")
+        if imdb_id:
+            link_line = f"https://www.imdb.com/title/{imdb_id}/"
+        else:
+            link_line = "לא נמצא מזהה IMDb"
+        prompt = await self.bot.send_message(
+            chat_id,
+            f"נבחר: *{title}*\nIMDb: {link_line}",
+            reply_markup=_kb(
+                [[
+                    ("בדיוק", _cb(workflow["id"], "im_ok")),
+                    ("אחד אחר", _cb(workflow["id"], "im_retry")),
+                ]]
+            ),
+        )
+        await store.update_workflow(
+            workflow["id"], step="confirm_imdb", last_prompt_message_id=prompt.id
+        )
 
     async def _apply_tmdb_candidate(self, chat_id: int, workflow: dict):
         payload = workflow.get("payload") or {}
@@ -779,15 +842,24 @@ class AdminWorkflowManager:
         payload["official_title"] = None
         payload["imdb_id"] = None
         payload["tmdb_id"] = None
+        payload["classification"] = "personal"
+        stremio_type = payload.get("stremio_type", "movie")
+        type_label = _stremio_type_hebrew(stremio_type)
         await store.update_workflow(workflow["id"], payload=payload)
         workflow["payload"] = payload
+        await self.bot.send_message(
+            chat_id,
+            f"סווג כ־Personal (יופיע בקטלוג Personal Telegram).\n"
+            f"סוג שנבחר: {type_label}.",
+        )
         await self._after_imdb_resolved(chat_id, workflow)
 
     async def _ask_manual_tt(self, chat_id: int, workflow: dict):
         prompt = await self.bot.send_message(
             chat_id,
             "שלח קישור IMDb או מזהה tt "
-            "(למשל `tt15398776` או https://www.imdb .com/title/tt15398776/).",
+            "(למשל `tt15398776` או https://www.imdb.com/title/tt15398776/)."
+            f"{_REPLY_HINT}",
         )
         await store.update_workflow(workflow["id"], step="ask_manual_tt", last_prompt_message_id=prompt.id)
 
@@ -805,14 +877,17 @@ class AdminWorkflowManager:
                 workflow["payload"] = payload
                 await self._ask_tags(chat_id, workflow)
                 return
-            prompt = await self.bot.send_message(chat_id, "מה העונה והפרק? (לדוגמה: S01E02)")
+            prompt = await self.bot.send_message(
+                chat_id, f"מה העונה והפרק? (לדוגמה: S01E02){_REPLY_HINT}"
+            )
             await store.update_workflow(workflow["id"], step="ask_season_episode", last_prompt_message_id=prompt.id)
             return
         await self._ask_tags(chat_id, workflow)
 
     async def _ask_tags(self, chat_id: int, workflow: dict, editing: bool = False):
         prompt = await self.bot.send_message(
-            chat_id, "תגים אופציונליים (איכות/שפה)? למשל: 1080p, דיבוב עברית\nאו שלח \"דלג\"."
+            chat_id,
+            f"תגים אופציונליים (איכות/שפה)? למשל: 1080p, דיבוב עברית\nאו שלח \"דלג\".{_REPLY_HINT}",
         )
         step = "edit_tags" if editing else "ask_tags"
         # Reopen the workflow in case it was already marked "done" (edit flow).
@@ -872,6 +947,8 @@ class AdminWorkflowManager:
             summary_lines.append(f"תגים: {', '.join(tags)}")
         if classification == "personal":
             summary_lines.append("קטגוריה: Personal Telegram")
+            if stremio_type:
+                summary_lines.append(f"סוג: {_stremio_type_hebrew(stremio_type)}")
         elif payload.get("source") == "torbox":
             summary_lines.append("מקור: TorBox")
 
