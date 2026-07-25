@@ -15,6 +15,7 @@ Design:
   endpoints directly; it only writes approved mappings that addon.py reads.
 """
 
+import asyncio
 import logging
 import re
 
@@ -29,6 +30,7 @@ from pyrogram.types import (
 from config import Config
 import metadata_store as store
 import tmdb_client
+import torbox_client
 from utils import parse_season_episode, get_metadata_from_cinemeta
 from search_utils import parse_video_resolution
 
@@ -42,6 +44,8 @@ _CONFIRM_WORDS = {"אישור", "אשר", "ok", "כן"}
 # Hard cap for TMDb pick-list buttons (Telegram keyboards get unwieldy past this).
 _TMDB_CHOICE_LIMIT = 15
 _BUTTON_LABEL_MAX = 60
+_TORBOX_POLL_SECONDS = 10
+_TORBOX_POLL_MAX_MINUTES = 180
 
 
 def extract_imdb_id(text: str) -> str | None:
@@ -75,6 +79,7 @@ class AdminWorkflowManager:
     def __init__(self):
         self.bot: Client = None
         self.is_running = False
+        self._torbox_cancel: dict[str, asyncio.Event] = {}
 
     def enabled(self) -> bool:
         return Config.admin_workflow_enabled()
@@ -137,6 +142,19 @@ class AdminWorkflowManager:
             except Exception as e:
                 logger.error(f"Error handling workflow text reply: {e}")
 
+        if Config.torbox_enabled():
+            @self.bot.on_message(filters.chat(group_id) & filters.text & ~filters.reply)
+            async def on_link(client, message: Message):
+                if not message.text or message.text.startswith("/"):
+                    return
+                url, magnet = torbox_client.parse_link_text(message.text)
+                if not url and not magnet:
+                    return
+                try:
+                    await self._on_torbox_link(message, url, magnet)
+                except Exception as e:
+                    logger.error(f"Error handling TorBox link: {e}")
+
         @self.bot.on_callback_query()
         async def on_callback(client, cq: CallbackQuery):
             try:
@@ -197,6 +215,244 @@ class AdminWorkflowManager:
         )
 
     # ------------------------------------------------------------------
+    # TorBox link entry (API only — no TorBox Telegram bot parsing)
+    # ------------------------------------------------------------------
+
+    async def _on_torbox_link(self, message: Message, url: str = None, magnet: str = None):
+        chat_id = message.chat.id
+        if await store.has_open_torbox_wait(chat_id):
+            await message.reply_text("⏳ כבר רץ תהליך TorBox פתוח בקבוצה. המתן או בטל אותו.")
+            return
+
+        created_by = message.from_user.id if message.from_user else None
+        kind = "torrent" if magnet else "webdl"
+
+        existing = None
+        if url:
+            existing = await torbox_client.find_web_download_by_link(url)
+        elif magnet:
+            existing = await torbox_client.find_torrent_by_magnet(magnet)
+
+        if existing:
+            pkg_id, file_id = torbox_client.item_ids(existing, kind)
+            mapping = await store.get_mapping_by_torbox(kind, pkg_id, file_id)
+            if mapping:
+                title = mapping.get("official_title") or mapping.get("declared_title") or mapping.get("file_name")
+                imdb = mapping.get("imdb_id") or "ללא tt"
+                await message.reply_text(
+                    f"ℹ️ הקובץ כבר במסד הנתונים:\n*{title}*\nIMDb: `{imdb}`"
+                )
+                return
+            await self._start_torbox_workflow(
+                message, existing, kind, url=url, magnet=magnet, created_by=created_by
+            )
+            return
+
+        created = None
+        if url:
+            created = await torbox_client.create_web_download(url)
+        else:
+            created = await torbox_client.create_torrent(magnet)
+
+        if not created:
+            await message.reply_text("❌ לא הצלחתי להוסיף את ההורדה ל-TorBox.")
+            return
+
+        new_id = None
+        if kind == "webdl":
+            new_id = created.get("webdownload_id") or created.get("id")
+        else:
+            new_id = created.get("torrent_id") or created.get("id")
+        try:
+            new_id = int(new_id) if new_id is not None else None
+        except (TypeError, ValueError):
+            new_id = None
+
+        item = None
+        if new_id:
+            if kind == "webdl":
+                item = await torbox_client.get_web_download(new_id)
+            else:
+                item = await torbox_client.get_torrent(new_id)
+        if not item:
+            if url:
+                item = await torbox_client.find_web_download_by_link(url)
+            elif magnet:
+                item = await torbox_client.find_torrent_by_magnet(magnet)
+        if not item:
+            item = {"id": new_id, "name": torbox_client.filename_from_url(url) if url else torbox_client.filename_from_magnet(magnet)}
+
+        await self._start_torbox_workflow(
+            message, item, kind, url=url, magnet=magnet, created_by=created_by
+        )
+
+    async def _start_torbox_workflow(
+        self,
+        message: Message,
+        item: dict,
+        kind: str,
+        *,
+        url: str = None,
+        magnet: str = None,
+        created_by: int = None,
+    ):
+        chat_id = message.chat.id
+        pkg_id, file_id = torbox_client.item_ids(item, kind)
+        file_name = torbox_client.item_display_name(item)
+        link_hash = torbox_client.web_link_hash(url) if url else torbox_client.magnet_info_hash(magnet or "")
+
+        workflow = await store.create_workflow(
+            chat_id=chat_id,
+            source_message_id=message.id,
+            created_by=created_by,
+        )
+        if not workflow:
+            await message.reply_text("❌ לא הצלחתי לפתוח תהליך עבודה.")
+            return
+
+        payload = {
+            "source": "torbox",
+            "torbox_kind": kind,
+            "torbox_id": pkg_id,
+            "torbox_file_id": file_id,
+            "torbox_hash": link_hash,
+            "torbox_status": "ready" if torbox_client.is_ready(item) else "pending",
+            "file_name": file_name,
+            "message_ids": [],
+            "caption": "",
+            "original_url": url or magnet or "",
+        }
+        await store.update_workflow(workflow["id"], payload=payload)
+        workflow["payload"] = payload
+
+        if torbox_client.is_ready(item):
+            await message.reply_text(f"✅ נמצא ב-TorBox: `{file_name}`\nמתחיל שאלות זיהוי…")
+            await self._ask_personal(chat_id, workflow)
+        else:
+            await self._begin_torbox_wait(chat_id, workflow, item)
+
+    async def _begin_torbox_wait(self, chat_id: int, workflow: dict, item: dict):
+        payload = workflow.get("payload") or {}
+        progress = int((item or {}).get("progress") or 0)
+        if progress <= 1:
+            progress_pct = int(progress * 100)
+        else:
+            progress_pct = int(progress)
+        status = await self.bot.send_message(
+            chat_id,
+            f"⏳ ממתין ל-TorBox… {progress_pct}%\n`{payload.get('file_name', '')}`",
+            reply_markup=_kb([[("❌ ביטול", _cb(workflow["id"], "tb_cancel"))]]),
+        )
+        payload["torbox_status_message_id"] = status.id
+        await store.update_workflow(
+            workflow["id"],
+            step="torbox_wait",
+            payload=payload,
+            last_prompt_message_id=status.id,
+        )
+        workflow["payload"] = payload
+        cancel = asyncio.Event()
+        self._torbox_cancel[workflow["id"]] = cancel
+        asyncio.create_task(self._torbox_poll_loop(workflow["id"]))
+
+    async def _torbox_poll_loop(self, workflow_id: str):
+        cancel = self._torbox_cancel.get(workflow_id)
+        if not cancel:
+            cancel = asyncio.Event()
+            self._torbox_cancel[workflow_id] = cancel
+        iterations = int((_TORBOX_POLL_MAX_MINUTES * 60) / _TORBOX_POLL_SECONDS)
+        try:
+            for _ in range(iterations):
+                if cancel.is_set():
+                    return
+                workflow = await store.get_workflow(workflow_id)
+                if not workflow or workflow.get("status") != "open":
+                    return
+                if workflow.get("step") != "torbox_wait":
+                    return
+                payload = workflow.get("payload") or {}
+                kind = payload.get("torbox_kind")
+                torbox_id = payload.get("torbox_id")
+                if not kind or not torbox_id:
+                    return
+                if kind == "webdl":
+                    item = await torbox_client.get_web_download(int(torbox_id))
+                else:
+                    item = await torbox_client.get_torrent(int(torbox_id))
+                if not item:
+                    await asyncio.sleep(_TORBOX_POLL_SECONDS)
+                    continue
+                pkg_id, file_id = torbox_client.item_ids(item, kind)
+                payload["torbox_id"] = pkg_id
+                payload["torbox_file_id"] = file_id
+                payload["file_name"] = torbox_client.item_display_name(item)
+                await store.update_workflow(workflow_id, payload=payload)
+                await self._refresh_torbox_wait_message(workflow, item)
+                if torbox_client.is_ready(item):
+                    payload["torbox_status"] = "ready"
+                    await store.update_workflow(workflow_id, payload=payload, step="ask_personal")
+                    await self.bot.send_message(
+                        workflow["chat_id"],
+                        f"✅ ההורדה ב-TorBox מוכנה: `{payload['file_name']}`\nמתחיל שאלות זיהוי…",
+                    )
+                    await self._ask_personal(workflow["chat_id"], {**workflow, "payload": payload})
+                    return
+                if (item.get("error") or "").strip():
+                    await self.bot.send_message(
+                        workflow["chat_id"],
+                        f"❌ שגיאה ב-TorBox: {item.get('error')}",
+                    )
+                    await store.mark_workflow_status(workflow_id, "cancelled")
+                    return
+                await asyncio.sleep(_TORBOX_POLL_SECONDS)
+            workflow = await store.get_workflow(workflow_id)
+            if workflow and workflow.get("status") == "open":
+                await self.bot.send_message(
+                    workflow["chat_id"],
+                    "⏱️ זמן ההמתנה ל-TorBox נגמר. נסה שוב מאוחר יותר.",
+                )
+                await store.mark_workflow_status(workflow_id, "cancelled")
+        finally:
+            self._torbox_cancel.pop(workflow_id, None)
+
+    async def _refresh_torbox_wait_message(self, workflow: dict, item: dict):
+        payload = workflow.get("payload") or {}
+        msg_id = payload.get("torbox_status_message_id")
+        if not msg_id:
+            return
+        progress = int(item.get("progress") or 0)
+        progress_pct = int(progress * 100) if progress <= 1 else int(progress)
+        state = item.get("download_state") or "…"
+        try:
+            await self.bot.edit_message_text(
+                workflow["chat_id"],
+                msg_id,
+                f"⏳ ממתין ל-TorBox… {progress_pct}% ({state})\n`{payload.get('file_name', '')}`",
+                reply_markup=_kb([[("❌ ביטול", _cb(workflow["id"], "tb_cancel"))]]),
+            )
+        except Exception:
+            pass
+
+    async def _cancel_torbox_wait(self, workflow: dict):
+        wf_id = workflow["id"]
+        cancel = self._torbox_cancel.get(wf_id)
+        if cancel:
+            cancel.set()
+        self._torbox_cancel.pop(wf_id, None)
+        payload = workflow.get("payload") or {}
+        msg_id = payload.get("torbox_status_message_id")
+        if msg_id:
+            try:
+                await self.bot.edit_message_text(
+                    workflow["chat_id"],
+                    msg_id,
+                    "❌ בוטל. ההורדה ב-TorBox ממשיכה ברקע.",
+                )
+            except Exception:
+                pass
+        await store.mark_workflow_status(wf_id, "cancelled")
+
+    # ------------------------------------------------------------------
     # Callback (button) handling
     # ------------------------------------------------------------------
 
@@ -210,6 +466,14 @@ class AdminWorkflowManager:
         workflow = await store.get_workflow(workflow_id)
         if not workflow or workflow.get("status") != "open":
             await cq.answer("השאלה הזו לא בתוקף יותר", show_alert=True)
+            return
+
+        if workflow.get("step") == "torbox_wait":
+            if action == "tb_cancel":
+                await cq.answer()
+                await self._cancel_torbox_wait(workflow)
+            else:
+                await cq.answer("ממתין ל-TorBox…", show_alert=True)
             return
 
         await cq.answer()
@@ -289,6 +553,10 @@ class AdminWorkflowManager:
         text = (message.text or "").strip()
         chat_id = message.chat.id
         payload = workflow.get("payload") or {}
+
+        if step == "torbox_wait":
+            await message.reply_text("⏳ עדיין ממתין ל-TorBox. אפשר לבטל עם הכפתור בהודעת ההמתנה.")
+            return
 
         if step == "ask_personal_name":
             payload["declared_title"] = text
@@ -580,6 +848,12 @@ class AdminWorkflowManager:
             resolution=resolution,
             file_name=file_name,
             created_by=workflow.get("created_by"),
+            source=payload.get("source", "telegram"),
+            torbox_kind=payload.get("torbox_kind"),
+            torbox_id=payload.get("torbox_id"),
+            torbox_file_id=payload.get("torbox_file_id"),
+            torbox_hash=payload.get("torbox_hash"),
+            torbox_status=payload.get("torbox_status"),
         )
 
         await store.mark_workflow_status(workflow["id"], "done")
@@ -598,6 +872,8 @@ class AdminWorkflowManager:
             summary_lines.append(f"תגים: {', '.join(tags)}")
         if classification == "personal":
             summary_lines.append("קטגוריה: Personal Telegram")
+        elif payload.get("source") == "torbox":
+            summary_lines.append("מקור: TorBox")
 
         # Post-save edit buttons temporarily hidden: the workflow is marked
         # "done" before this message is sent, so callbacks were rejected as

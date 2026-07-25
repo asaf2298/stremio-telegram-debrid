@@ -86,16 +86,17 @@ async def upsert_media_mapping(
     resolution: str = None,
     file_name: str = None,
     created_by: int = None,
+    source: str = "telegram",
+    torbox_kind: str = None,
+    torbox_id: int = None,
+    torbox_file_id: int = None,
+    torbox_hash: str = None,
+    torbox_status: str = None,
 ) -> Optional[dict]:
-    """Insert or update the mapping for a given Telegram source message set.
-
-    Uniqueness is enforced by (source_chat_id, message_ids, coalesce(zip_entry,''))
-    at the database level; we upsert via PostgREST's on_conflict-less approach:
-    try update-by-match first, fall back to insert.
-    """
+    """Insert or update the mapping for a Telegram message set or TorBox item."""
     payload = {
         "source_chat_id": source_chat_id,
-        "message_ids": message_ids,
+        "message_ids": message_ids or [],
         "zip_entry": zip_entry,
         "classification": classification,
         "stremio_type": stremio_type,
@@ -109,9 +110,18 @@ async def upsert_media_mapping(
         "resolution": resolution,
         "file_name": file_name,
         "created_by": created_by,
+        "source": source or "telegram",
+        "torbox_kind": torbox_kind,
+        "torbox_id": torbox_id,
+        "torbox_file_id": torbox_file_id,
+        "torbox_hash": torbox_hash,
+        "torbox_status": torbox_status,
     }
 
-    existing = await get_mapping_by_source(source_chat_id, message_ids, zip_entry)
+    if source == "torbox" and torbox_kind and torbox_id is not None:
+        existing = await get_mapping_by_torbox(torbox_kind, torbox_id, torbox_file_id)
+    else:
+        existing = await get_mapping_by_source(source_chat_id, message_ids, zip_entry)
     if existing:
         result = await _request(
             "PATCH",
@@ -141,6 +151,37 @@ async def get_mapping_by_source(source_chat_id: int, message_ids: list, zip_entr
         params["zip_entry"] = "is.null"
     rows = await _request("GET", "media_mappings", params=params)
     return rows[0] if rows else None
+
+
+async def get_mapping_by_torbox(
+    torbox_kind: str, torbox_id: int, torbox_file_id: int = None
+) -> Optional[dict]:
+    if not torbox_kind or torbox_id is None:
+        return None
+    params = {
+        "source": "eq.torbox",
+        "torbox_kind": f"eq.{torbox_kind}",
+        "torbox_id": f"eq.{torbox_id}",
+        "select": "*",
+        "limit": "1",
+        "order": "updated_at.desc",
+    }
+    if torbox_file_id is not None:
+        params["torbox_file_id"] = f"eq.{torbox_file_id}"
+    rows = await _request("GET", "media_mappings", params=params)
+    return rows[0] if rows else None
+
+
+async def has_open_torbox_wait(chat_id: int) -> bool:
+    params = {
+        "chat_id": f"eq.{chat_id}",
+        "status": "eq.open",
+        "step": "eq.torbox_wait",
+        "select": "id",
+        "limit": "1",
+    }
+    rows = await _request("GET", "media_workflows", params=params)
+    return bool(rows)
 
 
 async def get_mapping_by_imdb(

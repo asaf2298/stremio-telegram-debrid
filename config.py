@@ -38,6 +38,9 @@ class Config:
 
     TMDB_BEARER_TOKEN = os.getenv("TMDB_BEARER_TOKEN", "")
 
+    # Optional TorBox debrid (web links + magnets) for the Hebrew workflow + Stremio.
+    TORBOX_API_KEY = os.getenv("TORBOX_API_KEY", "")
+
     # Normalize away an accidentally-included /rest/v1 suffix (a common copy
     # -paste mistake from the Supabase dashboard) since metadata_store.py
     # appends /rest/v1 itself.
@@ -110,6 +113,10 @@ class Config:
     @classmethod
     def tmdb_enabled(cls) -> bool:
         return bool(cls.TMDB_BEARER_TOKEN)
+
+    @classmethod
+    def torbox_enabled(cls) -> bool:
+        return bool(cls.TORBOX_API_KEY)
 
     @classmethod
     def warn_admin_workflow_misconfig(cls):

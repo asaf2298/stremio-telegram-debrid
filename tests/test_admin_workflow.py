@@ -504,3 +504,46 @@ async def test_callback_rejected_when_workflow_not_open():
 
     cq.answer.assert_awaited_once()
     assert cq.answer.call_args.kwargs.get("show_alert") is True
+
+
+# ---------------------------------------------------------------------------
+# TorBox finalize
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_finalize_persists_torbox_fields():
+    _configure_enabled()
+    mgr = _manager()
+    workflow = {
+        "id": "wf-tb",
+        "chat_id": Config.MANAGEMENT_GROUP_ID,
+        "created_by": 999,
+        "payload": {
+            "source": "torbox",
+            "torbox_kind": "webdl",
+            "torbox_id": 55,
+            "torbox_file_id": 3,
+            "torbox_hash": "abc123",
+            "torbox_status": "ready",
+            "message_ids": [],
+            "file_name": "remote.mkv",
+            "declared_title": "Remote Movie",
+            "classification": "movie",
+            "stremio_type": "movie",
+            "imdb_id": "tt1234567",
+            "tags": ["1080p"],
+        },
+    }
+
+    with patch("tg_admin_workflow.store.upsert_media_mapping", new=AsyncMock(return_value={"id": "m-tb"})) as mock_upsert, \
+         patch("tg_admin_workflow.store.mark_workflow_status", new=AsyncMock()):
+        await mgr._finalize(Config.MANAGEMENT_GROUP_ID, workflow)
+
+    kwargs = mock_upsert.call_args.kwargs
+    assert kwargs["source"] == "torbox"
+    assert kwargs["torbox_kind"] == "webdl"
+    assert kwargs["torbox_id"] == 55
+    assert kwargs["torbox_file_id"] == 3
+    assert kwargs["torbox_hash"] == "abc123"
+    assert kwargs["torbox_status"] == "ready"
+    assert kwargs["message_ids"] == []
