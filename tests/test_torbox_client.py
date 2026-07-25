@@ -58,3 +58,53 @@ def test_build_permalink_torrent():
 def test_magnet_info_hash_extracts_btiH():
     magnet = "magnet:?xt=urn:btih:ABCDEF0123456789ABCDEF0123456789ABCDEF01&dn=test"
     assert torbox_client.magnet_info_hash(magnet) == "abcdef0123456789abcdef0123456789abcdef01"
+
+
+def test_extract_google_drive_id_from_usercontent():
+    url = (
+        "https://drive.usercontent.google.com/download"
+        "?id=1AIwLFXNOnDJ7OkXj7r8vGteauBMYTSVQ&export=download&authuser=0"
+    )
+    assert torbox_client.extract_google_drive_id(url) == "1AIwLFXNOnDJ7OkXj7r8vGteauBMYTSVQ"
+
+
+def test_normalize_web_download_url_usercontent_to_share_view():
+    url = (
+        "https://drive.usercontent.google.com/download"
+        "?id=1AIwLFXNOnDJ7OkXj7r8vGteauBMYTSVQ&export=download"
+    )
+    assert torbox_client.normalize_web_download_url(url) == (
+        "https://drive.google.com/file/d/1AIwLFXNOnDJ7OkXj7r8vGteauBMYTSVQ/view"
+    )
+
+
+def test_normalize_web_download_url_file_link_with_query():
+    url = "https://drive.google.com/file/d/ABC123xyz0123456789AB/view?usp=sharing"
+    assert torbox_client.normalize_web_download_url(url) == (
+        "https://drive.google.com/file/d/ABC123xyz0123456789AB/view"
+    )
+
+
+def test_normalize_web_download_url_uc_export():
+    url = "https://drive.google.com/uc?export=download&id=ABC123xyz0123456789AB"
+    assert torbox_client.normalize_web_download_url(url) == (
+        "https://drive.google.com/file/d/ABC123xyz0123456789AB/view"
+    )
+
+
+def test_normalize_web_download_url_skips_folders():
+    url = "https://drive.google.com/drive/folders/ABC123xyz0123456789AB"
+    assert torbox_client.normalize_web_download_url(url) == url
+
+
+def test_normalize_web_download_url_non_drive_unchanged():
+    url = "https://example.com/movie.mkv"
+    assert torbox_client.normalize_web_download_url(url) == url
+
+
+def test_parse_link_text_normalizes_google_drive():
+    url, magnet = torbox_client.parse_link_text(
+        "https://drive.google.com/uc?export=download&id=ABC123xyz0123456789AB"
+    )
+    assert magnet is None
+    assert url == "https://drive.google.com/file/d/ABC123xyz0123456789AB/view"

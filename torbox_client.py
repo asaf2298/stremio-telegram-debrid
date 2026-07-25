@@ -25,6 +25,12 @@ _MAGNET_RE = re.compile(r"^magnet:\?", re.IGNORECASE)
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _BTIH_RE = re.compile(r"btih:([a-fA-F0-9]{32,40})", re.IGNORECASE)
 _VIDEO_MIMES = ("video/", "application/x-matroska")
+_GDRIVE_FILE_PATH_RE = re.compile(r"/file/d/([A-Za-z0-9_-]{20,})", re.IGNORECASE)
+_GDRIVE_ID_PARAM_RE = re.compile(r"[?&]id=([A-Za-z0-9_-]{20,})", re.IGNORECASE)
+_GDRIVE_HOST_HINT_RE = re.compile(
+    r"(?:drive\.google\.com|docs\.google\.com|drive\.usercontent\.google\.com)",
+    re.IGNORECASE,
+)
 
 
 def is_configured() -> bool:
@@ -79,8 +85,38 @@ def parse_link_text(text: str) -> tuple[Optional[str], Optional[str]]:
     if _MAGNET_RE.match(raw):
         return None, raw
     if _URL_RE.match(raw):
-        return raw, None
+        return normalize_web_download_url(raw), None
     return None, None
+
+
+def extract_google_drive_id(url: str) -> Optional[str]:
+    """Extract a Google Drive file id from common share/download URL shapes."""
+    if not url or not _GDRIVE_HOST_HINT_RE.search(url):
+        return None
+    if "/folders/" in url.lower():
+        return None
+    m = _GDRIVE_FILE_PATH_RE.search(url)
+    if m:
+        return m.group(1)
+    m = _GDRIVE_ID_PARAM_RE.search(url)
+    if m:
+        return m.group(1)
+    return None
+
+
+def google_drive_share_url(file_id: str) -> str:
+    return f"https://drive.google.com/file/d/{file_id}/view"
+
+
+def normalize_web_download_url(url: str) -> str:
+    """Rewrite Google Drive links to the TorBox-friendly share URL format."""
+    if not url:
+        return url
+    raw = url.strip()
+    file_id = extract_google_drive_id(raw)
+    if not file_id:
+        return raw
+    return google_drive_share_url(file_id)
 
 
 def filename_from_url(url: str) -> str:
@@ -146,6 +182,7 @@ def item_ids(item: dict, kind: str) -> tuple[int, int]:
 
 
 async def create_web_download(url: str) -> Optional[dict]:
+    url = normalize_web_download_url(url)
     result = await _request("POST", "api/webdl/createwebdownload", data={"link": url})
     if not result:
         return None
@@ -208,6 +245,7 @@ async def get_torrent(torrent_id: int) -> Optional[dict]:
 
 
 async def find_web_download_by_link(url: str) -> Optional[dict]:
+    url = normalize_web_download_url(url)
     link_hash = web_link_hash(url)
     cached = await _request("GET", "api/webdl/checkcached", params={"hash": link_hash, "format": "object"})
     if isinstance(cached, dict):

@@ -319,6 +319,14 @@ class AdminWorkflowManager:
         created_by = message.from_user.id if message.from_user else None
         kind = "torrent" if magnet else "webdl"
 
+        if url:
+            original_url = url.strip()
+            url = torbox_client.normalize_web_download_url(url)
+            if url != original_url:
+                await message.reply_text(
+                    f"הקישור הומר לפורמט Google Drive ל־TorBox:\n`{url}`"
+                )
+
         existing = None
         if url:
             existing = await torbox_client.find_web_download_by_link(url)
