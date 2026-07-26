@@ -27,13 +27,13 @@ _REQUEST_TIMEOUT = 8.0
 WORKFLOW_TTL_SECONDS = 24 * 3600
 
 
-def _headers() -> dict:
+def _headers(*, prefer: str = "return=representation") -> dict:
     key = Config.SUPABASE_SERVICE_ROLE_KEY
     return {
         "apikey": key,
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
-        "Prefer": "return=representation",
+        "Prefer": prefer,
     }
 
 
@@ -45,13 +45,22 @@ def is_configured() -> bool:
     return Config.metadata_store_enabled()
 
 
-async def _request(method: str, path: str, params: dict = None, json: dict = None) -> Optional[list]:
+async def _request(
+    method: str,
+    path: str,
+    params: dict = None,
+    json: dict = None,
+    *,
+    prefer: str = "return=representation",
+) -> Optional[list]:
     if not is_configured():
         return None
     url = f"{_base_url()}/{path.lstrip('/')}"
     try:
         async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT) as client:
-            resp = await client.request(method, url, params=params, json=json, headers=_headers())
+            resp = await client.request(
+                method, url, params=params, json=json, headers=_headers(prefer=prefer)
+            )
             if resp.status_code >= 400:
                 logger.error(
                     "Supabase %s %s failed with status %s", method, path, resp.status_code
@@ -303,15 +312,12 @@ async def get_host_busy(host_id: str = "default") -> Optional[dict]:
 
 
 async def upsert_host_busy(payload: dict) -> Optional[dict]:
-    host_id = payload.get("id", "default")
-    existing = await get_host_busy(host_id)
-    if existing:
-        result = await _request(
-            "PATCH",
-            "personal_host_busy",
-            params={"id": f"eq.{host_id}"},
-            json=payload,
-        )
-    else:
-        result = await _request("POST", "personal_host_busy", json=payload)
+    """Atomic upsert on primary key ``id`` (no GET-then-PATCH race)."""
+    result = await _request(
+        "POST",
+        "personal_host_busy",
+        params={"on_conflict": "id"},
+        json=payload,
+        prefer="resolution=merge-duplicates,return=representation",
+    )
     return result[0] if result else None
