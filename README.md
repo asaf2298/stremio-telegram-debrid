@@ -29,6 +29,52 @@ Contributions and bug reports are welcome! If you encounter issues, feel free to
 
 ---
 
+---
+
+## 📌 About this deployment (asaf2298)
+
+> **Read this before the rest of the README.** This repository began from [`SunilRoy-dev/stremio-telegram-debrid`](https://github.com/SunilRoy-dev/stremio-telegram-debrid) and has diverged substantially. Most of the document below is the original upstream guide and is still broadly accurate for the **core streaming proxy** — but it documents **none** of the features added here.
+
+Measured against upstream: **44 files here vs 23 upstream; 21 files exist only here, none only upstream.**
+
+### Added in this deployment
+
+| Component | What it is |
+|---|---|
+| `tg_admin_workflow.py` (~44 KB) | Admin / bot workflow — the largest single addition |
+| `torbox_client.py` + `deployment/supabase/torbox_columns.sql` | **TorBox integration**, gated by `TORBOX_API_KEY` (see `Config.torbox_enabled`) |
+| `tmdb_client.py` | TMDB metadata lookups |
+| `metadata_store.py` | Metadata persistence layer |
+| `host_busy.py` + `deployment/supabase/personal_host_busy.sql` | `personal_host_busy` lease, shared with the ecosystem's media-intelligence worker |
+| `tests/` (8 files, ~53 KB) | Real `pytest` suite — admin workflow, addon mapping, metadata store, TMDB, TorBox, host-busy, tg-client concurrency |
+| `deployment/vps/` | Caddy and cloudflared docker-compose stacks |
+
+`addon.py` is also ~16 KB larger than upstream and `config.py` ~5 KB larger.
+
+### Running the tests
+
+Upstream has no test suite; this deployment does. Use it.
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest                     # configuration in pytest.ini
+```
+
+### Ecosystem role
+
+This addon is consumed by [`asaf2298/UserManager`](https://github.com/asaf2298/UserManager) as a **VIP provider** (`family: 'personal_telegram'`, transport `direct_owner`). Two consequences:
+
+- The aggregator matches it by **exact hostname**. The default `trycloudflare.com` quick tunnel rotates on restart; when it does, the aggregator silently demotes this addon and its integrity prior drops 0.82 → 0.60. Prefer the stable-hostname Caddy stack in `deployment/vps/`, and update `providerCapabilities.js` in `UserManager` whenever the URL changes.
+- Cache/VIP status **cannot** be signalled in stream titles — the aggregator ignores free text for this family.
+
+### Upstream merges
+
+Upstream has nothing this repo lacks, so treat it as a historical starting point rather than a live dependency. If you do cherry-pick a fix, it will only be relevant to the six shared core files (`addon.py`, `tg_client.py`, `config.py`, `utils.py`, `zip_helper.py`, `search_utils.py`) — expect conflicts.
+
+Licence remains upstream's **MIT-NC (non-commercial)**.
+
+---
+
 ## 🚀 Quick Start (For Beginners)
 
 Here is a simplified step-by-step roadmap to get the addon running on your phone or computer in less than 5 minutes:
